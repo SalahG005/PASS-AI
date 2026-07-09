@@ -4,6 +4,7 @@ import { HttpErrorResponse } from '@angular/common/http';
 import { Router } from '@angular/router';
 import { RouterLink } from '@angular/router';
 import { Auth } from '../auth';
+import { PasswordStrength, getPasswordStrength } from '../password-strength';
 
 @Component({
   selector: 'app-register',
@@ -17,8 +18,14 @@ export class Register {
   email = '';
   password = '';
   errorMessage = '';
+  passwordStrength: PasswordStrength = getPasswordStrength('');
 
   constructor(private auth: Auth, private router: Router) {}
+
+  onPasswordChange(value: string) {
+    this.password = value;
+    this.passwordStrength = getPasswordStrength(value);
+  }
 
   onSubmit() {
     this.errorMessage = '';
