@@ -1,0 +1,24 @@
+.panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  min-height: calc(100vh - 60px);
+  padding: 28px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+}
+
+h1 {
+  margin: 0;
+  font-size: 32px;
+}
+
+p {
+  margin: 14px 0 0;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 900px) {
+  .panel {
+    min-height: auto;
+  }
+}

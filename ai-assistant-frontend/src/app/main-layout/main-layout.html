@@ -1,0 +1,22 @@
+<div class="shell">
+  <aside class="sidebar">
+    <div>
+      <p class="eyebrow">PASS AI</p>
+      <h2>Workspace</h2>
+    </div>
+
+    <nav class="nav-list">
+      @for (item of navItems; track item.path) {
+        <a [routerLink]="item.path" routerLinkActive="active-nav" [routerLinkActiveOptions]="{ exact: true }">
+          {{ item.label }}
+        </a>
+      }
+    </nav>
+
+    <button class="btn-secondary" (click)="logout()">Sign out</button>
+  </aside>
+
+  <main class="content">
+    <router-outlet></router-outlet>
+  </main>
+</div>
