@@ -27,7 +27,7 @@ export class TerminalService {
     this.onDataCb = onData;
     this.onStatusCb = onStatus ?? null;
 
-    const token = this.auth.getToken();
+    const token = this.auth.getValidToken();
     if (!token) {
       this.onStatusCb?.('error');
       return;

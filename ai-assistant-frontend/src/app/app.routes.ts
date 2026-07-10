@@ -6,6 +6,7 @@ import { MainLayout } from './main-layout/main-layout';
 import { Register } from './register/register';
 
 export const routes: Routes = [
+  { path: '', pathMatch: 'full', redirectTo: 'login' },
   { path: 'login', component: Login },
   { path: 'register', component: Register },
   {
@@ -17,5 +18,5 @@ export const routes: Routes = [
       { path: 'chat', component: ChatHome }
     ]
   },
-  { path: '**', redirectTo: '' }
+  { path: '**', redirectTo: 'login' }
 ];

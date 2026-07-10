@@ -33,6 +33,7 @@
         type="text"
         autocomplete="name"
         [(ngModel)]="fullName"
+        (ngModelChange)="onFullNameChange($event)"
         [disabled]="loading"
       >
 
@@ -43,8 +44,14 @@
         type="email"
         autocomplete="email"
         [(ngModel)]="email"
+        (ngModelChange)="onEmailChange($event)"
+        (blur)="onEmailBlur()"
         [disabled]="loading"
       >
+
+      @if (emailError) {
+        <p class="error-text">{{ emailError }}</p>
+      }
 
       <label for="password">Password</label>
       <input
@@ -78,7 +85,7 @@
         </ul>
       </div>
 
-      <button type="button" class="btn-primary" [disabled]="loading" (click)="onSubmit($event)">
+      <button type="button" class="btn-primary" [disabled]="loading || !canSubmit" (click)="onSubmit($event)">
         {{ loading ? 'Creating account…' : 'Create account' }}
       </button>
 

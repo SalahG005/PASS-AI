@@ -15,6 +15,9 @@ import org.springframework.web.bind.annotation.*;
 @RequestMapping("/api/auth")
 public class AuthController {
 
+    private static final String ALLOWED_EMAIL_DOMAIN = "@pass-consulting.com";
+    private static final String EMAIL_PATTERN = "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$";
+
     @Autowired
     private UserRepository userRepository;
 
@@ -31,6 +34,18 @@ public class AuthController {
         }
 
         String email = req.getEmail().trim().toLowerCase();
+
+        if (!isValidEmailFormat(email)) {
+            return ResponseEntity.badRequest().body("Enter a valid email address");
+        }
+
+        if (!email.endsWith(ALLOWED_EMAIL_DOMAIN)) {
+            return ResponseEntity.badRequest().body("Only @pass-consulting.com email addresses are allowed.");
+        }
+
+        if (!isStrongPassword(req.getPassword())) {
+            return ResponseEntity.badRequest().body("Password must be at least 8 characters and include uppercase, lowercase, number, and special character.");
+        }
 
         if (userRepository.findByEmail(email).isPresent()) {
             return ResponseEntity.badRequest().body("Email already used");
@@ -66,5 +81,14 @@ public class AuthController {
 
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    private boolean isValidEmailFormat(String email) {
+        return email != null && email.matches(EMAIL_PATTERN);
+    }
+
+    private boolean isStrongPassword(String password) {
+        return password != null
+                && password.matches("^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[^A-Za-z0-9]).{8,}$");
     }
 }

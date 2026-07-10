@@ -33,6 +33,7 @@
         type="email"
         autocomplete="email"
         [(ngModel)]="email"
+        (ngModelChange)="onEmailChange($event)"
         [disabled]="loading"
       >
 
@@ -43,6 +44,7 @@
         type="password"
         autocomplete="current-password"
         [(ngModel)]="password"
+        (ngModelChange)="onPasswordChange($event)"
         [disabled]="loading"
       >
 
