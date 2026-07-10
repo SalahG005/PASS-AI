@@ -1,20 +1,41 @@
-:root {
-	--bg-base: #0f1118;
-	--bg-elevated: #1a1d26;
-	--bg-input: #161922;
-	--border-subtle: #2a2d38;
+:root,
+html[data-theme='dark'] {
+	--bg-base: #0c0e14;
+	--bg-elevated: #161922;
+	--bg-input: #12141c;
+	--border-subtle: #252836;
 	--text-primary: #e8ecf3;
-	--text-secondary: #a6adbb;
+	--text-secondary: #8b93a7;
 	--danger: #ff6e7f;
+	--ide-bg: #0c0e14;
 
-	--accent-blue: #2e9ef5;
+	--accent-blue: #3aa0ff;
 	--accent-indigo: #4a7fff;
-	--accent-violet: #a64aff;
+	--accent-violet: #8b5cff;
 	--accent-magenta: #c13fd6;
-	--accent-gradient: linear-gradient(135deg, #2e9ef5 0%, #4a7fff 45%, #a64aff 75%, #c13fd6 100%);
+	--accent-gradient: linear-gradient(135deg, #3aa0ff 0%, #4a7fff 45%, #8b5cff 75%, #c13fd6 100%);
 
 	--radius-md: 10px;
 	--shadow-panel: 0 20px 50px rgba(0, 0, 0, 0.45);
+}
+
+html[data-theme='light'] {
+	--bg-base: #f4f6f9;
+	--bg-elevated: #ffffff;
+	--bg-input: #ffffff;
+	--border-subtle: #e5e7eb;
+	--text-primary: #1f2937;
+	--text-secondary: #6b7280;
+	--danger: #dc2626;
+	--ide-bg: #ffffff;
+
+	--accent-blue: #2563eb;
+	--accent-indigo: #3b82f6;
+	--accent-violet: #7c3aed;
+	--accent-magenta: #d12798;
+	--accent-gradient: linear-gradient(135deg, #3b82f6 0%, #7c3aed 55%, #d12798 100%);
+
+	--shadow-panel: 0 16px 40px rgba(15, 23, 42, 0.08);
 }
 
 * {
@@ -25,10 +46,45 @@ html,
 body {
 	margin: 0;
 	min-height: 100%;
+	height: 100%;
 }
 
 body {
 	font-family: "Segoe UI", "Manrope", "Noto Sans", sans-serif;
-	background: radial-gradient(circle at 0% 0%, #171b28 0%, var(--bg-base) 35%), var(--bg-base);
+	background: var(--bg-base);
 	color: var(--text-primary);
+	transition: background-color 160ms ease, color 160ms ease;
+}
+
+app-root,
+app-main-layout,
+app-chat-home {
+	display: block;
+	height: 100%;
+}
+
+.theme-toggle {
+	position: fixed;
+	top: 16px;
+	right: 16px;
+	z-index: 100;
+	width: 36px;
+	height: 36px;
+	border: 1px solid var(--border-subtle);
+	border-radius: 10px;
+	background: var(--bg-elevated);
+	color: var(--text-primary);
+	cursor: pointer;
+	display: grid;
+	place-items: center;
+	box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+}
+
+.theme-toggle:hover {
+	border-color: var(--accent-blue);
+	color: var(--accent-blue);
+}
+
+.theme-toggle svg {
+	display: block;
 }

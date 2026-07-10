@@ -1,3 +1,22 @@
+<button
+  type="button"
+  class="theme-toggle"
+  (click)="theme.toggle()"
+  [title]="theme.theme() === 'light' ? 'Switch to dark mode' : 'Switch to light mode'"
+  [attr.aria-label]="theme.theme() === 'light' ? 'Switch to dark mode' : 'Switch to light mode'"
+>
+  @if (theme.theme() === 'light') {
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
+      <path d="M21 14.5A8.5 8.5 0 0 1 9.5 3 7 7 0 1 0 21 14.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+    </svg>
+  } @else {
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="1.7"/>
+      <path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.2 5.2l1.6 1.6M17.2 17.2l1.6 1.6M17.2 5.2l1.6-1.6M5.2 18.8l1.6-1.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+    </svg>
+  }
+</button>
+
 <div class="auth-screen">
   <section class="auth-card">
     <header class="auth-header">
@@ -6,14 +25,30 @@
       <p class="subtitle">Sign in to continue to your secure workspace.</p>
     </header>
 
-    <form class="auth-form" (ngSubmit)="onSubmit()">
+    <form class="auth-form" novalidate (submit)="$event.preventDefault(); onSubmit($event)">
       <label for="email">Email</label>
-      <input id="email" type="email" [(ngModel)]="email" name="email" required>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        autocomplete="email"
+        [(ngModel)]="email"
+        [disabled]="loading"
+      >
 
       <label for="password">Password</label>
-      <input id="password" type="password" [(ngModel)]="password" name="password" required>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        autocomplete="current-password"
+        [(ngModel)]="password"
+        [disabled]="loading"
+      >
 
-      <button type="submit" class="btn-primary">Sign in</button>
+      <button type="button" class="btn-primary" [disabled]="loading" (click)="onSubmit($event)">
+        {{ loading ? 'Signing in…' : 'Sign in' }}
+      </button>
 
       @if (errorMessage) {
         <p class="error-text">{{ errorMessage }}</p>

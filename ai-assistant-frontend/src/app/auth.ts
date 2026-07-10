@@ -5,8 +5,8 @@ import { HttpClient } from '@angular/common/http';
   providedIn: 'root'
 })
 export class Auth {
-
-  private baseUrl = 'http://localhost:8081/api/auth';
+  // Relative URL → Angular proxy forwards to http://localhost:8081 (avoids CORS)
+  private baseUrl = '/api/auth';
 
   constructor(private http: HttpClient) {}
 
