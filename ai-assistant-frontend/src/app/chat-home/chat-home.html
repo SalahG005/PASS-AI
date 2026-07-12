@@ -23,11 +23,50 @@
         <div class="menu-dropdown">
           <button type="button" (click)="menuNewFile()"><span>New File</span><kbd>Ctrl+N</kbd></button>
           <button type="button" (click)="menuOpenFolder()"><span>Open Folder</span><kbd>Ctrl+O</kbd></button>
+          <div class="menu-flyout-wrap">
+            <button
+              type="button"
+              class="menu-flyout-trigger"
+              (click)="toggleRecentSubmenu($event)"
+              (mouseenter)="showRecentSubmenu = true"
+            >
+              <span>Open Recent</span><span class="chev-right">›</span>
+            </button>
+            @if (showRecentSubmenu) {
+              <div class="menu-flyout" (click)="$event.stopPropagation()">
+                @if (!recentFiles.length && !recentFolders.length) {
+                  <div class="menu-empty">No recent files</div>
+                }
+                @if (recentFolders.length) {
+                  <div class="menu-section-label">Folders</div>
+                  @for (folder of recentFolders; track folder) {
+                    <button type="button" class="recent-item" [title]="folder" (click)="openRecentFolder(folder)">
+                      <span class="recent-name">{{ folder.split('\\').pop() || folder }}</span>
+                      <span class="recent-path">{{ folder }}</span>
+                    </button>
+                  }
+                }
+                @if (recentFiles.length) {
+                  <div class="menu-section-label">Files</div>
+                  @for (file of recentFiles; track file.path) {
+                    <button type="button" class="recent-item" [title]="file.path" (click)="openRecentFile(file)">
+                      <span class="recent-name">{{ file.name }}</span>
+                      <span class="recent-path">{{ file.path }}</span>
+                    </button>
+                  }
+                }
+                @if (recentFiles.length || recentFolders.length) {
+                  <div class="menu-sep"></div>
+                  <button type="button" (click)="clearRecentLists()">Clear Recently Opened</button>
+                }
+              </div>
+            }
+          </div>
           <div class="menu-sep"></div>
           <button type="button" (click)="menuNewTerminal()"><span>New Terminal</span><kbd>Ctrl+`</kbd></button>
           <button type="button" (click)="triggerImportFiles(); closeMenus()"><span>Import Files</span></button>
           <div class="menu-sep"></div>
-          <button type="button" (click)="menuOpenIde()"><span>Open IDE</span><kbd>Ctrl+Shift+N</kbd></button>
+          <button type="button" (click)="menuNewWindow()"><span>New Window</span><kbd>Ctrl+Shift+N</kbd></button>
           <div class="menu-sep"></div>
           <button type="button" (click)="menuSave()"><span>Save</span><kbd>Ctrl+S</kbd></button>
           <button type="button" (click)="logout()"><span>Exit</span></button>
@@ -128,6 +167,7 @@
     </div>
   </header>
 
+  <div class="ide-main">
   <div class="ide-body">
     <nav class="activity-bar" aria-label="Activity">
       <div class="activity-top">
@@ -170,17 +210,30 @@
     </nav>
 
     @if (showSidebar) {
-      <aside class="side-panel">
+      <aside
+        class="side-panel"
+        [class.resizing]="activeResize === 'side'"
+        [style.width.px]="sidePanelWidth"
+      >
+        <div
+          class="panel-sash panel-sash-e"
+          title="Drag to resize"
+          (mousedown)="startPanelResize('side', $event)"
+          (dblclick)="resetSidePanelWidth()"
+        ></div>
         @if (activeActivity === 'files') {
           <div class="panel-header">
-            <span>EXPLORER</span>
+            <span>{{ boundLocalPath ? 'EXPLORER' : 'WORKSPACE' }}</span>
             <div class="panel-actions">
+              <button type="button" title="Open real local folder" (click)="openRealLocalFolder()">📂</button>
               <button type="button" title="New File" (click)="createNewFile()">+</button>
-              <button type="button" title="Import Folder" (click)="triggerImportFolder()">📂</button>
               <button type="button" title="Refresh" (click)="refreshTree()">↻</button>
             </div>
           </div>
-          <div class="tree">
+          @if (boundLocalPath) {
+            <div class="bound-path" [title]="boundLocalPath">🔗 {{ boundLocalPath }}</div>
+          }
+          <div class="tree" (contextmenu)="$event.preventDefault()">
             @if (loadingTree) {
               <p class="muted" style="padding: 12px">Loading workspace…</p>
             }
@@ -190,7 +243,13 @@
           </div>
 
           <ng-template #treeNode let-node let-depth="depth">
-            <div class="tree-row" [style.paddingLeft.px]="10 + depth * 14" (click)="toggleNode(node); $event.stopPropagation()">
+            <div
+              class="tree-row"
+              [class.cut]="explorerClipboard?.mode === 'cut' && explorerClipboard?.path === node.path"
+              [style.paddingLeft.px]="10 + depth * 14"
+              (click)="toggleNode(node); $event.stopPropagation()"
+              (contextmenu)="openExplorerContextMenu($event, node)"
+            >
               <span class="chev">{{ node.type === 'folder' ? (node.expanded ? '▾' : '▸') : '' }}</span>
               <span
                 class="file-icon"
@@ -305,50 +364,55 @@
       </div>
 
       @if (showBottomPanel) {
-        <div class="bottom-panel">
+        <div
+          class="bottom-panel"
+          [class.maximized]="bottomMaximized"
+          [class.resizing]="activeResize === 'bottom'"
+          [style.height.px]="bottomPanelHeight"
+        >
+          <div
+            class="panel-sash panel-sash-n"
+            title="Drag to resize"
+            (mousedown)="startPanelResize('bottom', $event)"
+            (dblclick)="resetBottomPanelHeight()"
+          ></div>
           <div class="bottom-tabs">
             <div class="bottom-tabs-left">
-              <button type="button" [class.active]="bottomTab === 'terminal'" (click)="bottomTab = 'terminal'">TERMINAL</button>
               <button type="button" [class.active]="bottomTab === 'problems'" (click)="bottomTab = 'problems'; refreshProblems()">PROBLEMS</button>
               <button type="button" [class.active]="bottomTab === 'output'" (click)="bottomTab = 'output'">OUTPUT</button>
+              <button type="button" [class.active]="bottomTab === 'terminal'" (click)="bottomTab = 'terminal'; ideTerminal?.focus()">TERMINAL</button>
               <button type="button" [class.active]="bottomTab === 'debug'" (click)="bottomTab = 'debug'">DEBUG CONSOLE</button>
             </div>
             <div class="bottom-tabs-right">
               @if (bottomTab === 'terminal') {
-                <select
-                  class="shell-select"
-                  [ngModel]="terminalShell"
-                  (ngModelChange)="switchTerminalShell($event)"
-                  title="Shell"
-                >
-                  <option value="cmd">Invite de commandes</option>
-                  <option value="powershell">PowerShell</option>
-                </select>
+                <div class="term-toolbar">
+                  <span class="term-shell-icon" title="Shell">⌘</span>
+                  <select
+                    class="shell-select"
+                    [ngModel]="terminalShell"
+                    (ngModelChange)="switchTerminalShell($event)"
+                    title="Shell"
+                  >
+                    <option value="powershell">powershell</option>
+                    <option value="cmd">cmd</option>
+                  </select>
+                  <button type="button" class="term-tool" title="New Terminal" (click)="reconnectTerminal()">+</button>
+                  <button type="button" class="term-tool" title="Kill Terminal" (click)="killTerminal()">🗑</button>
+                  <button type="button" class="term-tool" title="Clear" (click)="clearTerminal()">⌫</button>
+                </div>
               }
-              <span class="shell-pill">{{ terminalStatus }}</span>
-              <button type="button" class="mini-btn" title="Reconnect" (click)="reconnectTerminal()">↻</button>
-              <button type="button" class="mini-btn" title="Ctrl+C" (click)="interruptTerminal()">⏹</button>
-              <button type="button" class="mini-btn" title="Clear" (click)="terminalText = ''">⌫</button>
+              <button type="button" class="mini-btn" title="Maximize" (click)="toggleBottomMaximize()">⤢</button>
               <button type="button" class="mini-btn" title="Hide panel" (click)="showBottomPanel = false">×</button>
             </div>
           </div>
 
           <div class="bottom-content">
-            @if (bottomTab === 'terminal') {
-              <div class="terminal">
-                <pre #terminalOut class="term-stream">{{ terminalText }}</pre>
-                <div class="term-input-row">
-                  <span class="term-input-mark">›</span>
-                  <input
-                    [(ngModel)]="terminalInput"
-                    (keydown.enter)="runTerminalCommand($event)"
-                    placeholder="Tapez une commande puis Entrée (dir, cd, python, git…)"
-                    autocomplete="off"
-                    spellcheck="false"
-                  />
-                </div>
-              </div>
-            }
+            <div class="vscode-terminal" [class.hidden-pane]="bottomTab !== 'terminal'">
+              <app-ide-terminal
+                [shell]="terminalShell"
+                (statusChange)="onTerminalStatus($event)"
+              ></app-ide-terminal>
+            </div>
             @if (bottomTab === 'problems') {
               <div class="problems-list">
                 @for (p of problems; track p.file + p.line + p.message) {
@@ -387,7 +451,17 @@
     </section>
 
     @if (showAiPanel) {
-      <aside class="ai-panel">
+      <aside
+        class="ai-panel"
+        [class.resizing]="activeResize === 'ai'"
+        [style.width.px]="aiPanelWidth"
+      >
+        <div
+          class="panel-sash panel-sash-w"
+          title="Drag to resize"
+          (mousedown)="startPanelResize('ai', $event)"
+          (dblclick)="resetAiPanelWidth()"
+        ></div>
         <div class="ai-header">
           <span class="ai-title">PASS AI ASSISTANT</span>
           <div class="ai-header-actions">
@@ -543,12 +617,13 @@
       <button type="button" class="status-icon" title="Delete file" (click)="deleteActivePath()">DEL</button>
     </div>
   </footer>
+  </div>
 
   @if (showOpenTargetDialog) {
     <div class="modal-backdrop" (click)="cancelOpenTarget()">
       <div class="modal-card" (click)="$event.stopPropagation()">
         <h3>Open Folder</h3>
-        <p>Where do you want to open the imported project?</p>
+        <p>Open a <strong>real local folder</strong>. Edits, deletes and renames will change files on your disk.</p>
         <div class="modal-actions">
           <button type="button" class="modal-primary" (click)="chooseOpenTarget('this')">This window</button>
           <button type="button" class="modal-secondary" (click)="chooseOpenTarget('new')">New window</button>
@@ -560,5 +635,33 @@
 
   @if (importing) {
     <div class="import-banner">{{ importProgress || 'Importing…' }}</div>
+  }
+
+  @if (contextMenu) {
+    <div
+      class="ctx-menu"
+      [style.left.px]="contextMenu.x"
+      [style.top.px]="contextMenu.y"
+      (click)="$event.stopPropagation()"
+      (contextmenu)="$event.preventDefault()"
+    >
+      <button type="button" (click)="ctxAddToChat()">Add to Chat</button>
+      <button type="button" (click)="ctxRevealInExplorer()">Reveal in File Explorer</button>
+      <div class="ctx-sep"></div>
+      <button type="button" (click)="ctxNewFile()">New File</button>
+      <button type="button" (click)="ctxNewFolder()">New Folder</button>
+      <div class="ctx-sep"></div>
+      <button type="button" (click)="ctxCopyPath(false)">Copy Path</button>
+      <button type="button" (click)="ctxCopyPath(true)">Copy Relative Path</button>
+      <div class="ctx-sep"></div>
+      <button type="button" [disabled]="!contextMenu.node.path" (click)="ctxCut()">Cut</button>
+      <button type="button" [disabled]="!contextMenu.node.path" (click)="ctxCopy()">Copy</button>
+      @if (explorerClipboard) {
+        <button type="button" (click)="ctxPaste()">Paste</button>
+      }
+      <div class="ctx-sep"></div>
+      <button type="button" [disabled]="!contextMenu.node.path" (click)="ctxRename()">Rename</button>
+      <button type="button" class="danger" [disabled]="!contextMenu.node.path" (click)="ctxDelete()">Delete</button>
+    </div>
   }
 </div>

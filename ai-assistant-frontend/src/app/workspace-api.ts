@@ -34,6 +34,13 @@ export interface UploadResult {
   tree?: WorkspaceNode;
 }
 
+export interface BindingResult {
+  ok?: boolean;
+  bound: boolean;
+  path: string;
+  tree?: WorkspaceNode;
+}
+
 @Injectable({ providedIn: 'root' })
 export class WorkspaceApi {
   private baseUrl = '/api/workspace';
@@ -42,6 +49,22 @@ export class WorkspaceApi {
 
   tree(): Observable<WorkspaceNode> {
     return this.http.get<WorkspaceNode>(`${this.baseUrl}/tree`);
+  }
+
+  binding(): Observable<BindingResult> {
+    return this.http.get<BindingResult>(`${this.baseUrl}/binding`);
+  }
+
+  openLocalFolder(): Observable<BindingResult> {
+    return this.http.post<BindingResult>(`${this.baseUrl}/open-local`, {});
+  }
+
+  bindLocalFolder(path: string): Observable<BindingResult> {
+    return this.http.post<BindingResult>(`${this.baseUrl}/bind`, { path });
+  }
+
+  unbindLocalFolder(): Observable<BindingResult> {
+    return this.http.post<BindingResult>(`${this.baseUrl}/unbind`, {});
   }
 
   readFile(path: string): Observable<FileContent> {
@@ -62,6 +85,22 @@ export class WorkspaceApi {
 
   deletePath(path: string): Observable<{ ok: boolean }> {
     return this.http.delete<{ ok: boolean }>(`${this.baseUrl}/path`, { params: { path } });
+  }
+
+  renamePath(from: string, to: string): Observable<{ ok: boolean; path: string }> {
+    return this.http.post<{ ok: boolean; path: string }>(`${this.baseUrl}/rename`, { from, to });
+  }
+
+  copyPath(from: string, to: string): Observable<{ ok: boolean; path: string }> {
+    return this.http.post<{ ok: boolean; path: string }>(`${this.baseUrl}/copy`, { from, to });
+  }
+
+  absolutePath(path: string): Observable<{ path: string }> {
+    return this.http.get<{ path: string }>(`${this.baseUrl}/absolute-path`, { params: { path } });
+  }
+
+  revealInExplorer(path: string): Observable<{ ok: boolean }> {
+    return this.http.post<{ ok: boolean }>(`${this.baseUrl}/reveal`, { path });
   }
 
   clear(): Observable<{ ok: boolean }> {

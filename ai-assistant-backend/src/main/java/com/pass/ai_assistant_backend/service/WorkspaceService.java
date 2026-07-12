@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.FileVisitResult;
+import java.nio.file.SimpleFileVisitor;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -19,15 +21,20 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 @Service
 public class WorkspaceService {
 
     private final Path root;
+    private final Path userHome;
+    private final ConcurrentHashMap<String, Path> bindings = new ConcurrentHashMap<>();
 
     public WorkspaceService(@Value("${app.workspace.root}") String rootPath) throws IOException {
         this.root = Paths.get(rootPath).toAbsolutePath().normalize();
+        this.userHome = Paths.get(System.getProperty("user.home")).toAbsolutePath().normalize();
         Files.createDirectories(this.root);
     }
 
@@ -36,6 +43,11 @@ public class WorkspaceService {
     }
 
     public Path resolveUserRoot(String email, String workspaceId) throws IOException {
+        Path bound = getBoundRoot(email, workspaceId);
+        if (bound != null) {
+            return bound;
+        }
+
         Path userRoot = root.resolve(hashEmail(email)).normalize();
         if (!userRoot.startsWith(root)) {
             throw new SecurityException("Invalid workspace path");
@@ -53,6 +65,189 @@ public class WorkspaceService {
         }
         Files.createDirectories(sessionRoot);
         return sessionRoot;
+    }
+
+    public String getBoundAbsolutePath(String email, String workspaceId) throws IOException {
+        Path bound = getBoundRoot(email, workspaceId);
+        return bound == null ? null : bound.toString();
+    }
+
+    public boolean isBound(String email, String workspaceId) throws IOException {
+        return getBoundRoot(email, workspaceId) != null;
+    }
+
+    public Path bindLocalFolder(String email, String workspaceId, String absolutePath) throws IOException {
+        Path target = validateExternalFolder(absolutePath);
+        Path link = linkFile(email, workspaceId);
+        Files.createDirectories(link.getParent());
+        Files.writeString(link, target.toString(), StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+        bindings.put(bindingKey(email, workspaceId), target);
+        return target;
+    }
+
+    public void unbindLocalFolder(String email, String workspaceId) throws IOException {
+        bindings.remove(bindingKey(email, workspaceId));
+        Path link = linkFile(email, workspaceId);
+        Files.deleteIfExists(link);
+    }
+
+    /**
+     * Opens a native OS folder picker on the machine running the backend
+     * (same PC as the user for local PASS AI), then binds that folder.
+     */
+    public Path pickAndBindLocalFolder(String email, String workspaceId) throws IOException {
+        Path picked = pickFolderNative();
+        if (picked == null) {
+            return null;
+        }
+        return bindLocalFolder(email, workspaceId, picked.toString());
+    }
+
+    private Path getBoundRoot(String email, String workspaceId) throws IOException {
+        String key = bindingKey(email, workspaceId);
+        Path cached = bindings.get(key);
+        if (cached != null && Files.isDirectory(cached)) {
+            return cached;
+        }
+
+        Path link = linkFile(email, workspaceId);
+        if (!Files.isRegularFile(link)) {
+            return null;
+        }
+        String raw = Files.readString(link, StandardCharsets.UTF_8).trim();
+        if (raw.isEmpty()) {
+            return null;
+        }
+        try {
+            Path target = validateExternalFolder(raw);
+            bindings.put(key, target);
+            return target;
+        } catch (SecurityException | IOException ex) {
+            Files.deleteIfExists(link);
+            bindings.remove(key);
+            return null;
+        }
+    }
+
+    private Path linkFile(String email, String workspaceId) throws IOException {
+        Path meta = root.resolve(hashEmail(email)).resolve(".links");
+        Files.createDirectories(meta);
+        String session = sanitizeWorkspaceId(workspaceId);
+        return meta.resolve((session == null ? "default" : session) + ".link");
+    }
+
+    private String bindingKey(String email, String workspaceId) {
+        String session = null;
+        try {
+            session = sanitizeWorkspaceId(workspaceId);
+        } catch (SecurityException ignored) {
+            session = null;
+        }
+        return hashEmail(email) + "::" + (session == null ? "default" : session);
+    }
+
+    private Path validateExternalFolder(String absolutePath) throws IOException {
+        if (absolutePath == null || absolutePath.isBlank()) {
+            throw new SecurityException("Folder path is required");
+        }
+        Path target = Paths.get(absolutePath.trim()).toAbsolutePath().normalize();
+        if (!Files.exists(target) || !Files.isDirectory(target)) {
+            throw new SecurityException("Folder does not exist: " + target);
+        }
+        if (!isAllowedExternalRoot(target)) {
+            throw new SecurityException("Folder is not allowed: " + target);
+        }
+        return target;
+    }
+
+    private boolean isAllowedExternalRoot(Path target) {
+        String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
+        // Always allow under the current user home
+        if (target.startsWith(userHome)) {
+            return !isDeniedSystemPath(target);
+        }
+        // Windows: allow other folders on the same machine under typical user data drives,
+        // but block Windows / Program Files / system roots.
+        if (os.contains("win")) {
+            return !isDeniedSystemPath(target);
+        }
+        // Non-Windows: stay under home only
+        return false;
+    }
+
+    private boolean isDeniedSystemPath(Path target) {
+        String p = target.toString().toLowerCase(Locale.ROOT).replace('/', '\\');
+        return p.startsWith("c:\\windows")
+                || p.startsWith("c:\\program files")
+                || p.startsWith("c:\\program files (x86)")
+                || p.equals("c:\\")
+                || p.startsWith("/etc")
+                || p.startsWith("/usr")
+                || p.startsWith("/bin")
+                || p.startsWith("/sbin")
+                || p.startsWith("/System");
+    }
+
+    private Path pickFolderNative() throws IOException {
+        String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
+        if (os.contains("win")) {
+            return pickFolderWindows();
+        }
+        // Fallback: no GUI picker — caller should use bind with an explicit path
+        return null;
+    }
+
+    private Path pickFolderWindows() throws IOException {
+        // Modern Explorer-style dialog (IFileOpenDialog), not the old tree FolderBrowserDialog
+        Path script = extractPickerScript();
+        ProcessBuilder pb = new ProcessBuilder(
+                "powershell.exe",
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy", "Bypass",
+                "-File", script.toAbsolutePath().toString()
+        );
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        String output;
+        try {
+            output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            boolean finished = process.waitFor(3, TimeUnit.MINUTES);
+            if (!finished) {
+                process.destroyForcibly();
+                throw new IOException("Folder picker timed out");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Folder picker interrupted", e);
+        }
+        if (output.isEmpty()) {
+            return null;
+        }
+        String[] lines = output.split("\\R");
+        String path = "";
+        for (String line : lines) {
+            if (!line.isBlank() && !line.startsWith("Add-Type") && !line.contains("Exception")) {
+                path = line.trim();
+            }
+        }
+        if (path.isEmpty() || path.contains("Error") || path.contains("Exception")) {
+            return null;
+        }
+        return Paths.get(path).toAbsolutePath().normalize();
+    }
+
+    private Path extractPickerScript() throws IOException {
+        Path tmp = Files.createTempFile("pass-ai-pick-folder-", ".ps1");
+        tmp.toFile().deleteOnExit();
+        try (var in = WorkspaceService.class.getResourceAsStream("/pick-folder-modern.ps1")) {
+            if (in == null) {
+                throw new IOException("Missing pick-folder-modern.ps1 on classpath");
+            }
+            Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return tmp;
     }
 
     private String sanitizeWorkspaceId(String workspaceId) {
@@ -76,8 +271,16 @@ public class WorkspaceService {
 
     public FileNodeDto tree(String email, String workspaceId) throws IOException {
         Path userRoot = resolveUserRoot(email, workspaceId);
-        FileNodeDto rootNode = new FileNodeDto(userRoot.getFileName().toString(), "", "folder");
-        rootNode.setName("workspace");
+        String label;
+        if (isBound(email, workspaceId)) {
+            // Real linked folder → show the actual folder name
+            label = userRoot.getFileName() != null ? userRoot.getFileName().toString() : userRoot.toString();
+        } else {
+            // Sandbox / new window session → never show raw ws_xxx id
+            label = "workspace";
+        }
+        FileNodeDto rootNode = new FileNodeDto(label, "", "folder");
+        rootNode.setName(label);
         rootNode.setChildren(listChildren(userRoot, userRoot));
         return rootNode;
     }
@@ -176,11 +379,93 @@ public class WorkspaceService {
         }
     }
 
+    public String renamePath(String email, String workspaceId, String fromRelative, String toRelative) throws IOException {
+        Path from = resolveSafe(email, workspaceId, fromRelative);
+        Path to = resolveSafe(email, workspaceId, toRelative);
+        if (!Files.exists(from)) {
+            throw new NoSuchFileException(fromRelative);
+        }
+        if (Files.exists(to)) {
+            throw new FileAlreadyExistsException(toRelative);
+        }
+        Files.createDirectories(to.getParent());
+        try {
+            Files.move(from, to, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ex) {
+            Files.move(from, to);
+        }
+        return toRelative(resolveUserRoot(email, workspaceId), to);
+    }
+
+    public String copyPath(String email, String workspaceId, String fromRelative, String toRelative) throws IOException {
+        Path from = resolveSafe(email, workspaceId, fromRelative);
+        Path to = resolveSafe(email, workspaceId, toRelative);
+        if (!Files.exists(from)) {
+            throw new NoSuchFileException(fromRelative);
+        }
+        if (Files.exists(to)) {
+            throw new FileAlreadyExistsException(toRelative);
+        }
+        if (Files.isDirectory(from)) {
+            copyDirectory(from, to);
+        } else {
+            Files.createDirectories(to.getParent());
+            Files.copy(from, to, StandardCopyOption.COPY_ATTRIBUTES);
+        }
+        return toRelative(resolveUserRoot(email, workspaceId), to);
+    }
+
+    private void copyDirectory(Path source, Path target) throws IOException {
+        Files.walkFileTree(source, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                Path dest = target.resolve(source.relativize(dir));
+                Files.createDirectories(dest);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Path dest = target.resolve(source.relativize(file));
+                Files.createDirectories(dest.getParent());
+                Files.copy(file, dest, StandardCopyOption.COPY_ATTRIBUTES, StandardCopyOption.REPLACE_EXISTING);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    public String absolutePath(String email, String workspaceId, String relativePath) throws IOException {
+        return resolveSafe(email, workspaceId, relativePath).toAbsolutePath().toString();
+    }
+
+    public void revealInExplorer(String email, String workspaceId, String relativePath) throws IOException {
+        Path target = resolveSafe(email, workspaceId, relativePath);
+        if (!Files.exists(target)) {
+            throw new NoSuchFileException(relativePath);
+        }
+        String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
+        ProcessBuilder pb;
+        if (os.contains("win")) {
+            // Select the file/folder in Windows Explorer
+            pb = new ProcessBuilder("explorer.exe", "/select,", target.toAbsolutePath().toString());
+        } else if (os.contains("mac")) {
+            pb = new ProcessBuilder("open", "-R", target.toAbsolutePath().toString());
+        } else {
+            Path openDir = Files.isDirectory(target) ? target : target.getParent();
+            pb = new ProcessBuilder("xdg-open", openDir.toAbsolutePath().toString());
+        }
+        pb.start();
+    }
+
     public void clearWorkspace(String email) throws IOException {
         clearWorkspace(email, null);
     }
 
     public void clearWorkspace(String email, String workspaceId) throws IOException {
+        if (isBound(email, workspaceId)) {
+            throw new SecurityException(
+                    "Refusing to clear a linked real folder. Open a sandbox workspace or unbind first.");
+        }
         Path userRoot = resolveUserRoot(email, workspaceId);
         if (!Files.exists(userRoot)) {
             return;

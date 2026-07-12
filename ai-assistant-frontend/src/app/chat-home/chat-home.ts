@@ -1,14 +1,16 @@
-import { Component, ElementRef, HostListener, OnDestroy, OnInit, ViewChild } from '@angular/core';
+import { Component, ApplicationRef, ChangeDetectorRef, ElementRef, HostListener, NgZone, OnDestroy, OnInit, ViewChild } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { NgTemplateOutlet } from '@angular/common';
 import { ActivatedRoute, Router } from '@angular/router';
 import { Auth } from '../auth';
 import { getFileIcon } from '../file-icons';
 import { MonacoEditorComponent } from '../monaco-editor/monaco-editor';
+import { IdeTerminalComponent } from '../ide-terminal/ide-terminal';
 import { TerminalService, TerminalShell } from '../terminal.service';
 import { ThemeService } from '../theme';
 import { WorkspaceSession } from '../workspace-session';
 import {
+  BindingResult,
   ProblemItem,
   SearchHit,
   UploadResult,
@@ -35,16 +37,35 @@ export interface ChatMessage {
   text: string;
 }
 
+export interface ExplorerClipboard {
+  mode: 'cut' | 'copy';
+  path: string;
+  name: string;
+  type: 'file' | 'folder';
+}
+
+export interface RecentFileEntry {
+  path: string;
+  name: string;
+  openedAt: number;
+}
+
+export interface ContextMenuState {
+  x: number;
+  y: number;
+  node: WorkspaceNode;
+}
+
 @Component({
   selector: 'app-chat-home',
-  imports: [FormsModule, NgTemplateOutlet, MonacoEditorComponent],
+  imports: [FormsModule, NgTemplateOutlet, MonacoEditorComponent, IdeTerminalComponent],
   templateUrl: './chat-home.html',
   styleUrl: './chat-home.css'
 })
 export class ChatHome implements OnInit, OnDestroy {
   @ViewChild('folderInput') folderInput?: ElementRef<HTMLInputElement>;
   @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
-  @ViewChild('terminalOut') terminalOut?: ElementRef<HTMLPreElement>;
+  @ViewChild(IdeTerminalComponent) ideTerminal?: IdeTerminalComponent;
 
   activeActivity: ActivityView = 'files';
   bottomTab: BottomPanelTab = 'terminal';
@@ -60,16 +81,23 @@ export class ChatHome implements OnInit, OnDestroy {
   pendingImportMode: 'folder' | 'files' | null = null;
   importing = false;
   importProgress = '';
+  boundLocalPath = '';
 
   searchQuery = '';
   searchHits: SearchHit[] = [];
   searching = false;
 
-  terminalInput = '';
-  terminalText = '';
   terminalStatus: 'connecting' | 'open' | 'closed' | 'error' = 'connecting';
-  terminalShell: TerminalShell = 'cmd';
-  private terminalSending = false;
+  terminalShell: TerminalShell = 'powershell';
+  bottomMaximized = false;
+  bottomPanelHeight = 220;
+  sidePanelWidth = 260;
+  aiPanelWidth = 360;
+  activeResize: 'bottom' | 'side' | 'ai' | null = null;
+
+  private bottomHeightBeforeMax = 220;
+  private resizeStartCoord = 0;
+  private resizeStartSize = 220;
 
   chatInput = '';
   nextMsgId = 1;
@@ -84,6 +112,15 @@ export class ChatHome implements OnInit, OnDestroy {
   openTabs: EditorTab[] = [];
   activeTabId = '';
   tabCounter = 0;
+
+  contextMenu: ContextMenuState | null = null;
+  explorerClipboard: ExplorerClipboard | null = null;
+  recentFiles: RecentFileEntry[] = [];
+  recentFolders: string[] = [];
+  showRecentSubmenu = false;
+  private readonly recentFilesKey = 'pass-ai-recent-files';
+  private readonly recentFoldersKey = 'pass-ai-recent-folders';
+  private readonly maxRecent = 12;
 
   messages: ChatMessage[] = [];
 
@@ -132,17 +169,22 @@ export class ChatHome implements OnInit, OnDestroy {
     private workspace: WorkspaceApi,
     private terminal: TerminalService,
     private workspaceSession: WorkspaceSession,
+    private cdr: ChangeDetectorRef,
+    private ngZone: NgZone,
+    private appRef: ApplicationRef,
+    private host: ElementRef<HTMLElement>,
     public theme: ThemeService
   ) {}
 
   ngOnInit() {
     this.openTabs = [];
     this.activeTabId = '';
+    this.loadRecentLists();
     this.refreshTree();
     this.refreshProblems();
-    this.connectTerminal();
+    this.refreshBinding();
 
-    // New window opened with ?import=folder|files&ws=... → empty workspace + file picker
+    // New window opened with ?import=folder|files&ws=... → open real local folder
     const importMode = this.route.snapshot.queryParamMap.get('import');
     if (importMode === 'folder' || importMode === 'files') {
       void this.router.navigate([], {
@@ -150,10 +192,10 @@ export class ChatHome implements OnInit, OnDestroy {
         queryParams: {},
         replaceUrl: true
       });
-      this.statusMessage = 'Empty workspace — choose a folder to import';
+      this.statusMessage = 'Select a real local folder…';
       setTimeout(() => {
         if (importMode === 'folder') {
-          this.folderInput?.nativeElement.click();
+          this.openRealLocalFolder();
         } else {
           this.fileInput?.nativeElement.click();
         }
@@ -196,40 +238,199 @@ export class ChatHome implements OnInit, OnDestroy {
     }
   }
 
-  refreshTree() {
+  refreshTree(extraExpandPaths: string[] = []) {
+    const expanded = this.collectExpandedPaths(this.fileTree);
+    expanded.add(''); // root always open
+    for (const p of extraExpandPaths) {
+      if (p !== undefined && p !== null) {
+        expanded.add(p);
+        // Also expand all parents so the change is visible
+        let cur = p;
+        while (cur.includes('/')) {
+          cur = cur.slice(0, cur.lastIndexOf('/'));
+          expanded.add(cur);
+        }
+      }
+    }
     this.loadingTree = true;
     this.workspace.tree().subscribe({
       next: (root) => {
-        this.fileTree = this.markExpanded([root]);
-        this.loadingTree = false;
-        this.statusMessage = 'Workspace synced';
+        this.ngZone.run(() => {
+          this.fileTree = this.applyExpandedState([root], expanded);
+          this.loadingTree = false;
+          this.statusMessage = this.boundLocalPath
+            ? `Linked: ${this.boundLocalPath}`
+            : 'Workspace synced';
+          this.cdr.detectChanges();
+        });
       },
       error: (err) => {
-        this.loadingTree = false;
-        this.statusMessage = 'Failed to load workspace';
-        this.pushOutput(`Tree error: ${err?.message || err}`);
+        this.ngZone.run(() => {
+          this.loadingTree = false;
+          this.statusMessage = 'Failed to load workspace';
+          this.pushOutput(`Tree error: ${err?.message || err}`);
+          this.cdr.detectChanges();
+        });
       }
     });
   }
 
+  private collectExpandedPaths(nodes: WorkspaceNode[], out = new Set<string>()): Set<string> {
+    for (const n of nodes) {
+      if (n.type === 'folder' && n.expanded) {
+        out.add(n.path || '');
+      }
+      if (n.children?.length) {
+        this.collectExpandedPaths(n.children, out);
+      }
+    }
+    return out;
+  }
+
+  private applyExpandedState(nodes: WorkspaceNode[], expanded: Set<string>): WorkspaceNode[] {
+    return this.filterTree(nodes).map((n) => {
+      const path = n.path || '';
+      const isFolder = n.type === 'folder';
+      return {
+        ...n,
+        expanded: isFolder ? expanded.has(path) || path === '' : undefined,
+        children: n.children?.length ? this.applyExpandedState(n.children, expanded) : []
+      };
+    });
+  }
+
+  refreshBinding() {
+    this.workspace.binding().subscribe({
+      next: (res) => {
+        this.boundLocalPath = res.bound ? res.path : '';
+        if (this.boundLocalPath) {
+          this.statusMessage = `Linked: ${this.boundLocalPath}`;
+        }
+      },
+      error: () => {
+        this.boundLocalPath = '';
+      }
+    });
+  }
+
+  /** Opens native Windows folder dialog and works directly on that real folder. */
+  openRealLocalFolder() {
+    this.showNewMenu = false;
+    this.openMenu = null;
+    this.showRecentSubmenu = false;
+    this.importing = true;
+    this.importProgress = 'Opening folder picker…';
+    this.statusMessage = this.importProgress;
+    this.cdr.detectChanges();
+
+    this.workspace.openLocalFolder().subscribe({
+      next: (res) => this.applyLinkedWorkspace(res),
+      error: (err) => {
+        this.syncUiAfterOsDialog(() => {
+          this.importing = false;
+          this.importProgress = '';
+          const msg = typeof err?.error === 'string' ? err.error : 'Folder open cancelled or failed';
+          if (String(msg).toLowerCase().includes('cancel')) {
+            this.statusMessage = 'Folder selection cancelled';
+            return;
+          }
+          const typed = prompt(
+            'Paste the full local folder path to edit for real (e.g. C:\\Users\\maram\\my-project):',
+            this.boundLocalPath || 'C:\\Users\\maram\\'
+          );
+          if (!typed?.trim()) {
+            this.statusMessage = msg;
+            return;
+          }
+          this.bindTypedLocalFolder(typed.trim());
+        });
+      }
+    });
+  }
+
+  bindTypedLocalFolder(path: string) {
+    this.importing = true;
+    this.importProgress = 'Linking folder…';
+    this.statusMessage = this.importProgress;
+    this.cdr.detectChanges();
+    this.workspace.bindLocalFolder(path).subscribe({
+      next: (res) => this.applyLinkedWorkspace(res),
+      error: (err) => {
+        this.syncUiAfterOsDialog(() => {
+          this.importing = false;
+          this.importProgress = '';
+          this.statusMessage = 'Link failed';
+          alert(typeof err?.error === 'string' ? err.error : 'Could not link folder');
+        });
+      }
+    });
+  }
+
+  /** Apply linked-folder result and force explorer to repaint (OS dialog steals focus/zone). */
+  private applyLinkedWorkspace(res: BindingResult) {
+    this.syncUiAfterOsDialog(() => {
+      this.importing = false;
+      this.importProgress = '';
+      this.boundLocalPath = res.path || '';
+      if (res.path) {
+        this.rememberRecentFolder(res.path);
+      }
+      this.openTabs = [];
+      this.activeTabId = '';
+      this.statusMessage = `Editing real folder: ${res.path}`;
+      this.pushOutput(`[workspace] Linked real folder ${res.path}`);
+
+      if (res.tree) {
+        this.fileTree = this.applyExpandedState([res.tree], new Set(['']));
+        this.loadingTree = false;
+      }
+      // Always re-fetch so the explorer updates even if the dialog left Angular's zone
+      this.refreshTree(['']);
+      this.refreshProblems();
+      this.reconnectTerminal();
+    });
+  }
+
+  /**
+   * Native Windows dialogs (folder picker / prompt) pause the UI thread.
+   * Force Angular to paint as soon as focus returns — no extra click needed.
+   */
+  private syncUiAfterOsDialog(action: () => void) {
+    this.ngZone.run(() => {
+      action();
+      this.cdr.detectChanges();
+      this.appRef.tick();
+    });
+    // OS dialog often returns focus a frame later — repaint then without re-running side effects
+    setTimeout(() => {
+      this.ngZone.run(() => {
+        this.cdr.detectChanges();
+        this.appRef.tick();
+      });
+    }, 0);
+    setTimeout(() => {
+      this.ngZone.run(() => {
+        this.cdr.detectChanges();
+        this.appRef.tick();
+      });
+    }, 100);
+  }
+
   private markExpanded(nodes: WorkspaceNode[]): WorkspaceNode[] {
-    return this.filterTree(nodes).map((n) => ({
-      ...n,
-      // Don't auto-expand deep trees; keep root open only
-      expanded: n.type === 'folder' && !n.path ? true : n.type === 'folder' ? false : undefined,
-      children: n.children ? this.markExpandedChildren(n.children) : []
-    }));
+    return this.applyExpandedState(nodes, new Set(['']));
   }
 
   private markExpandedChildren(nodes: WorkspaceNode[]): WorkspaceNode[] {
-    return this.filterTree(nodes).map((n) => ({
-      ...n,
-      expanded: false,
-      children: n.children ? this.markExpandedChildren(n.children) : []
-    }));
+    return this.applyExpandedState(nodes, new Set());
+  }
+
+  /** Run after native prompt/confirm so the explorer refreshes without needing an extra click. */
+  private afterNativeDialog(action: () => void) {
+    this.syncUiAfterOsDialog(action);
   }
 
   toggleNode(node: WorkspaceNode) {
+    this.closeContextMenu();
     if (node.type === 'folder') {
       // Never treat cache folders as openable content
       if (this.isHiddenTreeNode(node)) {
@@ -247,29 +448,393 @@ export class ChatHome implements OnInit, OnDestroy {
     this.openRemoteFile(node.path, node.name);
   }
 
+  openExplorerContextMenu(event: MouseEvent, node: WorkspaceNode) {
+    event.preventDefault();
+    event.stopPropagation();
+    this.openMenu = null;
+    this.showNewMenu = false;
+    const pad = 8;
+    const menuW = 240;
+    const menuH = 360;
+    const x = Math.min(event.clientX, window.innerWidth - menuW - pad);
+    const y = Math.min(event.clientY, window.innerHeight - menuH - pad);
+    this.contextMenu = { x: Math.max(pad, x), y: Math.max(pad, y), node };
+  }
+
+  closeContextMenu() {
+    this.contextMenu = null;
+  }
+
+  @HostListener('document:click')
+  onDocumentClick() {
+    this.closeContextMenu();
+  }
+
+  @HostListener('document:keydown.escape')
+  onEscape() {
+    this.closeContextMenu();
+  }
+
+  private parentDir(path: string): string {
+    const normalized = (path || '').replace(/\\/g, '/');
+    const idx = normalized.lastIndexOf('/');
+    return idx >= 0 ? normalized.slice(0, idx) : '';
+  }
+
+  private joinPath(dir: string, name: string): string {
+    const cleanName = name.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!dir) {
+      return cleanName;
+    }
+    return `${dir.replace(/\/+$/, '')}/${cleanName}`;
+  }
+
+  private targetDirForCreate(node: WorkspaceNode): string {
+    return node.type === 'folder' ? node.path : this.parentDir(node.path);
+  }
+
+  private uniqueSiblingPath(dir: string, baseName: string): string {
+    let candidate = this.joinPath(dir, baseName);
+    let i = 1;
+    const dot = baseName.lastIndexOf('.');
+    const stem = dot > 0 ? baseName.slice(0, dot) : baseName;
+    const ext = dot > 0 ? baseName.slice(dot) : '';
+    while (this.pathExistsInTree(candidate)) {
+      candidate = this.joinPath(dir, `${stem} copy${i > 1 ? ` ${i}` : ''}${ext}`);
+      i += 1;
+    }
+    return candidate;
+  }
+
+  private pathExistsInTree(path: string): boolean {
+    const walk = (nodes: WorkspaceNode[]): boolean => {
+      for (const n of nodes) {
+        if (n.path === path) {
+          return true;
+        }
+        if (n.children?.length && walk(n.children)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    return walk(this.fileTree);
+  }
+
+  private rewriteOpenTabPaths(from: string, to: string, isFolder: boolean) {
+    for (const tab of this.openTabs) {
+      if (!isFolder && tab.path === from) {
+        tab.path = to;
+        tab.title = to.split('/').pop() || to;
+      } else if (isFolder && (tab.path === from || tab.path.startsWith(from + '/'))) {
+        tab.path = to + tab.path.slice(from.length);
+        tab.title = tab.path.split('/').pop() || tab.path;
+      }
+    }
+  }
+
+  private closeTabsUnderPath(path: string, isFolder: boolean) {
+    const doomed = this.openTabs.filter((t) =>
+      isFolder ? t.path === path || t.path.startsWith(path + '/') : t.path === path
+    );
+    for (const tab of doomed) {
+      this.closeTab(new Event('click'), tab.id);
+    }
+  }
+
+  ctxAddToChat() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node) {
+      return;
+    }
+    this.showAiPanel = true;
+    this.aiTab = 'chat';
+    const label = node.type === 'folder' ? 'folder' : 'file';
+    const hint = `@${node.path} `;
+    this.chatInput = (this.chatInput ? this.chatInput + ' ' : '') + hint;
+    this.messages.push({
+      id: this.nextMsgId++,
+      role: 'assistant',
+      text: `Added ${label} \`${node.path}\` to chat context.`
+    });
+    this.statusMessage = `Added ${node.name} to chat`;
+  }
+
+  ctxRevealInExplorer() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node) {
+      return;
+    }
+    this.workspace.revealInExplorer(node.path || '.').subscribe({
+      next: () => {
+        this.statusMessage = `Revealed ${node.name || 'workspace'} in File Explorer`;
+      },
+      error: (err) => {
+        this.statusMessage = 'Reveal failed';
+        alert(typeof err?.error === 'string' ? err.error : 'Could not open File Explorer');
+      }
+    });
+  }
+
+  ctxNewFile() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node) {
+      return;
+    }
+    const dir = this.targetDirForCreate(node);
+    const name = prompt('New file name', 'Untitled.txt');
+    if (!name?.trim()) {
+      return;
+    }
+    const path = this.joinPath(dir, name.trim());
+    this.afterNativeDialog(() => {
+      this.workspace.createFile(path, '').subscribe({
+        next: (file) => {
+          this.refreshTree([dir]);
+          this.openRemoteFile(file.path, file.path.split('/').pop());
+          this.statusMessage = `Created ${file.path}`;
+        },
+        error: (err) => {
+          alert(typeof err?.error === 'string' ? err.error : 'Create file failed');
+        }
+      });
+    });
+  }
+
+  ctxNewFolder() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node) {
+      return;
+    }
+    const dir = this.targetDirForCreate(node);
+    const name = prompt('New folder name', 'New Folder');
+    if (!name?.trim()) {
+      return;
+    }
+    const path = this.joinPath(dir, name.trim());
+    this.afterNativeDialog(() => {
+      this.workspace.createFolder(path).subscribe({
+        next: () => {
+          this.refreshTree([dir, path]);
+          this.statusMessage = `Created folder ${path}`;
+        },
+        error: (err) => {
+          alert(typeof err?.error === 'string' ? err.error : 'Create folder failed');
+        }
+      });
+    });
+  }
+
+  ctxCopyPath(relative: boolean) {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node) {
+      return;
+    }
+    if (relative) {
+      const text = node.path || '.';
+      navigator.clipboard.writeText(text).then(
+        () => (this.statusMessage = `Copied relative path: ${text}`),
+        () => (this.statusMessage = 'Clipboard copy failed')
+      );
+      return;
+    }
+    this.workspace.absolutePath(node.path || '.').subscribe({
+      next: (res) => {
+        navigator.clipboard.writeText(res.path).then(
+          () => (this.statusMessage = `Copied path: ${res.path}`),
+          () => (this.statusMessage = 'Clipboard copy failed')
+        );
+      },
+      error: () => (this.statusMessage = 'Could not resolve absolute path')
+    });
+  }
+
+  ctxCut() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node || !node.path) {
+      return;
+    }
+    this.explorerClipboard = { mode: 'cut', path: node.path, name: node.name, type: node.type };
+    this.statusMessage = `Cut ${node.name}`;
+  }
+
+  ctxCopy() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node || !node.path) {
+      return;
+    }
+    this.explorerClipboard = { mode: 'copy', path: node.path, name: node.name, type: node.type };
+    this.statusMessage = `Copied ${node.name}`;
+  }
+
+  ctxPaste() {
+    const node = this.contextMenu?.node;
+    const clip = this.explorerClipboard;
+    this.closeContextMenu();
+    if (!node || !clip) {
+      return;
+    }
+    const destDir = this.targetDirForCreate(node);
+    const to = this.uniqueSiblingPath(destDir, clip.name);
+    if (clip.mode === 'copy') {
+      this.workspace.copyPath(clip.path, to).subscribe({
+        next: (res) => {
+          this.refreshTree([destDir]);
+          this.statusMessage = `Pasted ${res.path}`;
+        },
+        error: (err) => alert(typeof err?.error === 'string' ? err.error : 'Paste failed')
+      });
+      return;
+    }
+    this.workspace.renamePath(clip.path, to).subscribe({
+      next: (res) => {
+        this.rewriteOpenTabPaths(clip.path, res.path, clip.type === 'folder');
+        this.explorerClipboard = null;
+        this.refreshTree([destDir]);
+        this.statusMessage = `Moved to ${res.path}`;
+      },
+      error: (err) => alert(typeof err?.error === 'string' ? err.error : 'Move failed')
+    });
+  }
+
+  ctxRename() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node || !node.path) {
+      return;
+    }
+    const nextName = prompt('Rename to', node.name);
+    if (!nextName?.trim() || nextName.trim() === node.name) {
+      return;
+    }
+    const parent = this.parentDir(node.path);
+    const to = this.joinPath(parent, nextName.trim());
+    this.afterNativeDialog(() => {
+      this.workspace.renamePath(node.path, to).subscribe({
+        next: (res) => {
+          this.rewriteOpenTabPaths(node.path, res.path, node.type === 'folder');
+          this.refreshTree([parent]);
+          this.statusMessage = `Renamed to ${res.path}`;
+        },
+        error: (err) => alert(typeof err?.error === 'string' ? err.error : 'Rename failed')
+      });
+    });
+  }
+
+  ctxDelete() {
+    const node = this.contextMenu?.node;
+    this.closeContextMenu();
+    if (!node || !node.path) {
+      return;
+    }
+    if (!confirm(`Delete ${node.path}?`)) {
+      return;
+    }
+    const parent = this.parentDir(node.path);
+    this.afterNativeDialog(() => {
+      this.workspace.deletePath(node.path).subscribe({
+        next: () => {
+          this.closeTabsUnderPath(node.path, node.type === 'folder');
+          this.refreshTree([parent]);
+          this.refreshProblems();
+          this.statusMessage = `Deleted ${node.path}`;
+        },
+        error: () => (this.statusMessage = 'Delete failed')
+      });
+    });
+  }
+
   openRemoteFile(path: string, name?: string) {
     const existing = this.openTabs.find((t) => t.path === path && !t.unsavedNew);
     if (existing) {
       this.activeTabId = existing.id;
+      this.rememberRecentFile(path, name || existing.title);
       return;
     }
 
     this.workspace.readFile(path).subscribe({
       next: (file) => {
+        const title = name || path.split('/').pop() || path;
         const tab: EditorTab = {
           id: `file-${++this.tabCounter}`,
-          title: name || path.split('/').pop() || path,
+          title,
           path: file.path,
           content: file.content
         };
         this.openTabs.push(tab);
         this.activeTabId = tab.id;
+        this.rememberRecentFile(file.path, title);
       },
       error: (err) => {
         this.statusMessage = 'Could not open file';
         this.pushOutput(`Open error: ${err?.error || err?.message || err}`);
       }
     });
+  }
+
+  private loadRecentLists() {
+    try {
+      const files = JSON.parse(localStorage.getItem(this.recentFilesKey) || '[]');
+      this.recentFiles = Array.isArray(files) ? files.slice(0, this.maxRecent) : [];
+    } catch {
+      this.recentFiles = [];
+    }
+    try {
+      const folders = JSON.parse(localStorage.getItem(this.recentFoldersKey) || '[]');
+      this.recentFolders = Array.isArray(folders) ? folders.slice(0, this.maxRecent) : [];
+    } catch {
+      this.recentFolders = [];
+    }
+  }
+
+  private rememberRecentFile(path: string, name?: string) {
+    if (!path) {
+      return;
+    }
+    const entry: RecentFileEntry = {
+      path,
+      name: name || path.split('/').pop() || path,
+      openedAt: Date.now()
+    };
+    this.recentFiles = [entry, ...this.recentFiles.filter((f) => f.path !== path)].slice(0, this.maxRecent);
+    localStorage.setItem(this.recentFilesKey, JSON.stringify(this.recentFiles));
+  }
+
+  private rememberRecentFolder(absolutePath: string) {
+    if (!absolutePath) {
+      return;
+    }
+    this.recentFolders = [absolutePath, ...this.recentFolders.filter((p) => p !== absolutePath)].slice(
+      0,
+      this.maxRecent
+    );
+    localStorage.setItem(this.recentFoldersKey, JSON.stringify(this.recentFolders));
+  }
+
+  openRecentFile(entry: RecentFileEntry) {
+    this.closeMenus();
+    this.openRemoteFile(entry.path, entry.name);
+  }
+
+  openRecentFolder(absolutePath: string) {
+    this.closeMenus();
+    this.bindTypedLocalFolder(absolutePath);
+  }
+
+  clearRecentLists() {
+    this.recentFiles = [];
+    this.recentFolders = [];
+    localStorage.removeItem(this.recentFilesKey);
+    localStorage.removeItem(this.recentFoldersKey);
+    this.statusMessage = 'Recent list cleared';
+    this.closeMenus();
   }
 
   selectTab(id: string) {
@@ -296,25 +861,29 @@ export class ChatHome implements OnInit, OnDestroy {
       return;
     }
     const path = name.replace(/\\/g, '/').replace(/^\/+/, '');
-    this.workspace.createFile(path, '').subscribe({
-      next: (file) => {
-        this.refreshTree();
-        const tab: EditorTab = {
-          id: `file-${++this.tabCounter}`,
-          title: path.split('/').pop() || path,
-          path: file.path,
-          content: file.content,
-          dirty: false
-        };
-        this.openTabs.push(tab);
-        this.activeTabId = tab.id;
-        this.statusMessage = `Created ${path}`;
-        this.refreshProblems();
-      },
-      error: (err) => {
-        this.statusMessage = 'Create file failed';
-        alert(typeof err?.error === 'string' ? err.error : 'Create file failed');
-      }
+    const parent = this.parentDir(path);
+    this.afterNativeDialog(() => {
+      this.workspace.createFile(path, '').subscribe({
+        next: (file) => {
+          this.refreshTree([parent]);
+          const tab: EditorTab = {
+            id: `file-${++this.tabCounter}`,
+            title: path.split('/').pop() || path,
+            path: file.path,
+            content: file.content,
+            dirty: false
+          };
+          this.openTabs.push(tab);
+          this.activeTabId = tab.id;
+          this.rememberRecentFile(file.path, tab.title);
+          this.statusMessage = `Created ${path}`;
+          this.refreshProblems();
+        },
+        error: (err) => {
+          this.statusMessage = 'Create file failed';
+          alert(typeof err?.error === 'string' ? err.error : 'Create file failed');
+        }
+      });
     });
   }
 
@@ -345,10 +914,10 @@ export class ChatHome implements OnInit, OnDestroy {
       return;
     }
 
-    // Give the dialog time to close before the OS file picker opens
+    // Give the dialog time to close before the OS folder picker opens
     setTimeout(() => {
       if (mode === 'folder') {
-        this.folderInput?.nativeElement.click();
+        this.openRealLocalFolder();
       } else {
         this.fileInput?.nativeElement.click();
       }
@@ -406,6 +975,7 @@ export class ChatHome implements OnInit, OnDestroy {
   closeMenus() {
     this.openMenu = null;
     this.showNewMenu = false;
+    this.showRecentSubmenu = false;
   }
 
   menuNewFile() {
@@ -418,6 +988,11 @@ export class ChatHome implements OnInit, OnDestroy {
     this.triggerImportFolder();
   }
 
+  toggleRecentSubmenu(event: Event) {
+    event.stopPropagation();
+    this.showRecentSubmenu = !this.showRecentSubmenu;
+  }
+
   menuNewTerminal() {
     this.closeMenus();
     this.showBottomPanel = true;
@@ -426,8 +1001,50 @@ export class ChatHome implements OnInit, OnDestroy {
   }
 
   menuOpenIde() {
+    this.menuNewWindow();
+  }
+
+  /** Opens a fresh empty IDE window (root labeled "workspace"). */
+  menuNewWindow() {
     this.closeMenus();
-    this.openRealIdeWindow('folder');
+    this.openFreshIdeWindow();
+  }
+
+  /** Opens a real browser popup with an empty isolated workspace. */
+  private openFreshIdeWindow() {
+    const width = Math.min(1480, screen.availWidth - 40);
+    const height = Math.min(920, screen.availHeight - 60);
+    const left = Math.max(0, Math.round((screen.availWidth - width) / 2));
+    const top = Math.max(0, Math.round((screen.availHeight - height) / 2));
+    const features = [
+      'popup=yes',
+      `width=${width}`,
+      `height=${height}`,
+      `left=${left}`,
+      `top=${top}`,
+      'menubar=no',
+      'toolbar=no',
+      'location=no',
+      'status=no',
+      'resizable=yes',
+      'scrollbars=yes'
+    ].join(',');
+
+    const url = `${window.location.origin}/chat?ws=${encodeURIComponent(this.workspaceSession.createFreshId())}`;
+    const win = window.open(url, `pass-ai-${Date.now()}`, features);
+
+    if (!win || win.closed) {
+      this.statusMessage = 'Popup blocked — allow popups for localhost.';
+      alert('Popup blocked by the browser.\n\nAllow popups for http://localhost:4200, then try New Window again.');
+      return;
+    }
+
+    try {
+      win.focus();
+    } catch {
+      // ignore
+    }
+    this.statusMessage = 'Opened a new PASS AI window';
   }
 
   menuToggleSidebar() {
@@ -493,10 +1110,15 @@ export class ChatHome implements OnInit, OnDestroy {
   private filterTree(nodes: WorkspaceNode[]): WorkspaceNode[] {
     return nodes
       .filter((n) => !this.isHiddenTreeNode(n))
-      .map((n) => ({
-        ...n,
-        children: n.children ? this.filterTree(n.children) : []
-      }));
+      .map((n) => {
+        const isRootSessionId =
+          !n.path && typeof n.name === 'string' && /^ws_[a-z0-9_]+$/i.test(n.name);
+        return {
+          ...n,
+          name: isRootSessionId ? 'workspace' : n.name,
+          children: n.children ? this.filterTree(n.children) : []
+        };
+      });
   }
 
   private collectFiles(list: FileList, useRelativePath: boolean): { files: File[]; paths: string[]; skipped: number } {
@@ -700,16 +1322,19 @@ export class ChatHome implements OnInit, OnDestroy {
     if (!confirm(`Delete ${tab.path}?`)) {
       return;
     }
-    this.workspace.deletePath(tab.path).subscribe({
-      next: () => {
-        this.closeTab(new Event('click'), tab.id);
-        this.refreshTree();
-        this.refreshProblems();
-        this.statusMessage = `Deleted ${tab.path}`;
-      },
-      error: () => {
-        this.statusMessage = 'Delete failed';
-      }
+    const parent = this.parentDir(tab.path);
+    this.afterNativeDialog(() => {
+      this.workspace.deletePath(tab.path).subscribe({
+        next: () => {
+          this.closeTab(new Event('click'), tab.id);
+          this.refreshTree([parent]);
+          this.refreshProblems();
+          this.statusMessage = `Deleted ${tab.path}`;
+        },
+        error: () => {
+          this.statusMessage = 'Delete failed';
+        }
+      });
     });
   }
 
@@ -745,105 +1370,134 @@ export class ChatHome implements OnInit, OnDestroy {
 
   connectTerminal() {
     this.terminalStatus = 'connecting';
-    this.terminal.connect(
-      (chunk) => {
-        this.terminalText += chunk;
-        setTimeout(() => this.scrollTerminal(), 0);
-      },
-      (status) => {
-        this.terminalStatus = status === 'open' ? 'open' : status;
-        if (status === 'open') {
-          const label = this.terminalShell === 'powershell' ? 'PowerShell' : 'Invite de commandes';
-          this.pushOutput(`[terminal] ${label} connected to real workspace`);
-        }
-      },
-      this.terminalShell
-    );
+    this.ideTerminal?.connect();
   }
 
   switchTerminalShell(shell: TerminalShell) {
-    if (this.terminalShell === shell && this.terminal.isConnected) {
+    if (this.terminalShell === shell) {
       return;
     }
     this.terminalShell = shell;
-    this.terminal.disconnect();
-    this.terminalText = '';
-    this.connectTerminal();
+    // IdeTerminalComponent reconnects via ngOnChanges when shell input changes
+    setTimeout(() => this.ideTerminal?.focus(), 50);
   }
 
   reconnectTerminal() {
-    this.terminal.disconnect();
-    this.terminalText += `\n— reconnecting ${this.terminalShell === 'powershell' ? 'PowerShell' : 'cmd'} —\n`;
-    this.connectTerminal();
-  }
-
-  runTerminalCommand(event?: Event) {
-    event?.preventDefault();
-    event?.stopPropagation();
-    const cmd = this.terminalInput;
-    if (!cmd.trim()) {
-      return;
-    }
-    // Prevent accidental double-Enter firing the same command twice
-    if (this.terminalSending) {
-      return;
-    }
-    const trimmed = cmd.trim().toLowerCase();
-    if (trimmed === 'clear' || trimmed === 'cls') {
-      this.terminalText = '';
-      this.terminalInput = '';
-      return;
-    }
-
-    this.terminalSending = true;
-    // Append command onto the current shell prompt line (no extra '>').
-    const t = this.terminalText;
-    if (t.length === 0 || t.endsWith('\n') || t.endsWith('\r')) {
-      this.terminalText += cmd + '\r\n';
-    } else if (t.endsWith('>')) {
-      this.terminalText += ' ' + cmd + '\r\n';
-    } else {
-      this.terminalText += '\r\n' + cmd + '\r\n';
-    }
-    this.terminalInput = '';
-    setTimeout(() => this.scrollTerminal(), 0);
-
-    const finish = () => {
-      setTimeout(() => {
-        this.terminalSending = false;
-      }, 150);
-    };
-
-    if (!this.terminal.isConnected) {
-      this.connectTerminal();
-      const trySend = (attempt: number) => {
-        if (this.terminal.isConnected) {
-          this.terminal.sendLine(cmd);
-          finish();
-          return;
-        }
-        if (attempt < 40) {
-          setTimeout(() => trySend(attempt + 1), 50);
-        } else {
-          finish();
-        }
-      };
-      trySend(0);
-      return;
-    }
-    this.terminal.sendLine(cmd);
-    finish();
+    this.terminalStatus = 'connecting';
+    this.ideTerminal?.killAndReconnect();
   }
 
   interruptTerminal() {
-    this.terminal.interrupt();
+    this.ideTerminal?.interrupt();
   }
 
-  private scrollTerminal() {
-    const el = this.terminalOut?.nativeElement;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
+  clearTerminal() {
+    this.ideTerminal?.clear();
+  }
+
+  onTerminalStatus(status: 'connecting' | 'open' | 'closed' | 'error') {
+    this.terminalStatus = status;
+  }
+
+  killTerminal() {
+    this.terminal.disconnect();
+    this.terminalStatus = 'closed';
+  }
+
+  startPanelResize(kind: 'bottom' | 'side' | 'ai', event: MouseEvent) {
+    if (event.button !== 0) {
+      return;
     }
+    event.preventDefault();
+    event.stopPropagation();
+    if (kind === 'bottom' && this.bottomMaximized) {
+      this.bottomMaximized = false;
+    }
+    this.activeResize = kind;
+    this.resizeStartCoord = kind === 'bottom' ? event.clientY : event.clientX;
+    this.resizeStartSize =
+      kind === 'bottom' ? this.bottomPanelHeight : kind === 'side' ? this.sidePanelWidth : this.aiPanelWidth;
+    document.body.style.cursor = kind === 'bottom' ? 'ns-resize' : 'ew-resize';
+    document.body.style.userSelect = 'none';
+  }
+
+  @HostListener('document:mousemove', ['$event'])
+  onPanelResizeMove(event: MouseEvent) {
+    if (!this.activeResize) {
+      return;
+    }
+    if (this.activeResize === 'bottom') {
+      const delta = this.resizeStartCoord - event.clientY;
+      this.bottomPanelHeight = this.clampBottomHeight(this.resizeStartSize + delta);
+      return;
+    }
+    if (this.activeResize === 'side') {
+      const delta = event.clientX - this.resizeStartCoord;
+      this.sidePanelWidth = this.clampSideWidth(this.resizeStartSize + delta);
+      return;
+    }
+    const delta = this.resizeStartCoord - event.clientX;
+    this.aiPanelWidth = this.clampAiWidth(this.resizeStartSize + delta);
+  }
+
+  @HostListener('document:mouseup')
+  onPanelResizeEnd() {
+    if (!this.activeResize) {
+      return;
+    }
+    this.activeResize = null;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  }
+
+  resetBottomPanelHeight() {
+    this.bottomMaximized = false;
+    this.bottomPanelHeight = 220;
+  }
+
+  resetSidePanelWidth() {
+    this.sidePanelWidth = 260;
+  }
+
+  resetAiPanelWidth() {
+    this.aiPanelWidth = 360;
+  }
+
+  toggleBottomMaximize() {
+    if (!this.bottomMaximized) {
+      this.bottomHeightBeforeMax = this.bottomPanelHeight;
+      const workspaceEl = this.host.nativeElement.querySelector('.workspace') as HTMLElement | null;
+      const avail = workspaceEl?.clientHeight ?? 600;
+      this.bottomPanelHeight = this.clampBottomHeight(Math.floor(avail * 0.72));
+      this.bottomMaximized = true;
+    } else {
+      this.bottomPanelHeight = this.clampBottomHeight(this.bottomHeightBeforeMax);
+      this.bottomMaximized = false;
+    }
+  }
+
+  private clampBottomHeight(height: number): number {
+    const workspaceEl = this.host.nativeElement.querySelector('.workspace') as HTMLElement | null;
+    const avail = workspaceEl?.clientHeight ?? 800;
+    const min = 120;
+    const max = Math.max(min, Math.floor(avail * 0.85));
+    return Math.min(max, Math.max(min, Math.round(height)));
+  }
+
+  private clampSideWidth(width: number): number {
+    const body = this.host.nativeElement.querySelector('.ide-body') as HTMLElement | null;
+    const avail = body?.clientWidth ?? 1200;
+    const min = 160;
+    const max = Math.max(min, Math.floor(avail * 0.45));
+    return Math.min(max, Math.max(min, Math.round(width)));
+  }
+
+  private clampAiWidth(width: number): number {
+    const body = this.host.nativeElement.querySelector('.ide-body') as HTMLElement | null;
+    const avail = body?.clientWidth ?? 1200;
+    const min = 260;
+    const max = Math.max(min, Math.floor(avail * 0.5));
+    return Math.min(max, Math.max(min, Math.round(width)));
   }
 
   runDebug() {

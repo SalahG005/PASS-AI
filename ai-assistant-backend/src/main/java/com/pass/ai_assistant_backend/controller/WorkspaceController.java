@@ -123,6 +123,155 @@ public class WorkspaceController {
         }
     }
 
+    @PostMapping("/rename")
+    public ResponseEntity<?> rename(
+            Authentication authentication,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            String path = workspaceService.renamePath(
+                    email(authentication), workspaceId, body.get("from"), body.get("to"));
+            return ResponseEntity.ok(Map.of("ok", true, "path", path));
+        } catch (NoSuchFileException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Path not found");
+        } catch (FileAlreadyExistsException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Target already exists");
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
+    @PostMapping("/copy")
+    public ResponseEntity<?> copy(
+            Authentication authentication,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            String path = workspaceService.copyPath(
+                    email(authentication), workspaceId, body.get("from"), body.get("to"));
+            return ResponseEntity.ok(Map.of("ok", true, "path", path));
+        } catch (NoSuchFileException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Path not found");
+        } catch (FileAlreadyExistsException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Target already exists");
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
+    @GetMapping("/absolute-path")
+    public ResponseEntity<?> absolutePath(
+            Authentication authentication,
+            @RequestParam String path,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            String absolute = workspaceService.absolutePath(email(authentication), workspaceId, path);
+            return ResponseEntity.ok(Map.of("path", absolute));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
+    @PostMapping("/reveal")
+    public ResponseEntity<?> reveal(
+            Authentication authentication,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            workspaceService.revealInExplorer(email(authentication), workspaceId, body.get("path"));
+            return ResponseEntity.ok(Map.of("ok", true));
+        } catch (NoSuchFileException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Path not found");
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
+    @GetMapping("/binding")
+    public ResponseEntity<?> binding(
+            Authentication authentication,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) throws IOException {
+        String path = workspaceService.getBoundAbsolutePath(email(authentication), workspaceId);
+        return ResponseEntity.ok(Map.of(
+                "bound", path != null,
+                "path", path == null ? "" : path
+        ));
+    }
+
+    @PostMapping("/open-local")
+    public ResponseEntity<?> openLocal(
+            Authentication authentication,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            var bound = workspaceService.pickAndBindLocalFolder(email(authentication), workspaceId);
+            if (bound == null) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Folder selection cancelled");
+            }
+            return ResponseEntity.ok(Map.of(
+                    "ok", true,
+                    "bound", true,
+                    "path", bound.toString(),
+                    "tree", workspaceService.tree(email(authentication), workspaceId)
+            ));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
+    @PostMapping("/bind")
+    public ResponseEntity<?> bind(
+            Authentication authentication,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            var bound = workspaceService.bindLocalFolder(email(authentication), workspaceId, body.get("path"));
+            return ResponseEntity.ok(Map.of(
+                    "ok", true,
+                    "bound", true,
+                    "path", bound.toString(),
+                    "tree", workspaceService.tree(email(authentication), workspaceId)
+            ));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
+    @PostMapping("/unbind")
+    public ResponseEntity<?> unbind(
+            Authentication authentication,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            workspaceService.unbindLocalFolder(email(authentication), workspaceId);
+            return ResponseEntity.ok(Map.of(
+                    "ok", true,
+                    "bound", false,
+                    "tree", workspaceService.tree(email(authentication), workspaceId)
+            ));
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
     @PostMapping("/clear")
     public ResponseEntity<?> clear(
             Authentication authentication,
