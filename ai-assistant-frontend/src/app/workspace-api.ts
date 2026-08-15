@@ -39,6 +39,49 @@ export interface BindingResult {
   bound: boolean;
   path: string;
   tree?: WorkspaceNode;
+  project?: ProjectSummary;
+}
+
+export interface ProjectSummary {
+  projectId: string;
+  name: string;
+  absolutePath: string;
+  storageType: string;
+  createdAt?: string;
+  updatedAt?: string;
+  lastOpenedAt?: string;
+}
+
+export interface ProjectOpenResult {
+  project: ProjectSummary;
+  bound: boolean;
+  path: string;
+  tree?: WorkspaceNode;
+}
+
+export interface SnapshotResult {
+  ok: boolean;
+  gitAvailable?: boolean;
+  created?: boolean;
+  commit?: string;
+  message?: string;
+  error?: string;
+}
+
+export interface RevertResult {
+  ok: boolean;
+  message?: string;
+  error?: string;
+}
+
+export interface BuildResult {
+  ok: boolean;
+  command: string;
+  exitCode: number;
+  output: string[];
+  tail: string;
+  projectDir: string;
+  error?: string;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -137,5 +180,69 @@ export class WorkspaceApi {
 
   debugRun(command: string): Observable<{ output: string[] }> {
     return this.http.post<{ output: string[] }>(`${this.baseUrl}/debug/run`, { command });
+  }
+
+  snapshot(message: string): Observable<SnapshotResult> {
+    return this.http.post<SnapshotResult>(`${this.baseUrl}/snapshot`, { message });
+  }
+
+  revert(commit?: string): Observable<RevertResult> {
+    return this.http.post<RevertResult>(`${this.baseUrl}/revert`, commit ? { commit } : {});
+  }
+
+  build(): Observable<BuildResult> {
+    return this.http.post<BuildResult>(`${this.baseUrl}/build`, {});
+  }
+
+  /** Copy Maven Wrapper into a folder that has pom.xml (no global mvn needed). */
+  ensureMavenWrapper(path = ''): Observable<{
+    ok: boolean;
+    copied?: string[];
+    command?: string;
+    projectDir?: string;
+    error?: string;
+  }> {
+    return this.http.post<{
+      ok: boolean;
+      copied?: string[];
+      command?: string;
+      projectDir?: string;
+      error?: string;
+    }>(`${this.baseUrl}/ensure-maven-wrapper`, { path });
+  }
+
+  listProjects(): Observable<ProjectSummary[]> {
+    return this.http.get<ProjectSummary[]>('/api/projects');
+  }
+
+  createProject(name?: string): Observable<ProjectOpenResult> {
+    return this.http.post<ProjectOpenResult>('/api/projects', name ? { name } : {});
+  }
+
+  openProject(projectId: string): Observable<ProjectOpenResult> {
+    return this.http.post<ProjectOpenResult>(`/api/projects/${encodeURIComponent(projectId)}/open`, {});
+  }
+
+  openLocalProject(): Observable<ProjectOpenResult> {
+    return this.http.post<ProjectOpenResult>('/api/projects/open-local', {});
+  }
+
+  linkProject(path: string, name?: string): Observable<ProjectOpenResult> {
+    return this.http.post<ProjectOpenResult>('/api/projects/link', { path, name });
+  }
+
+  ensureProject(name?: string, workspaceId?: string): Observable<ProjectOpenResult> {
+    return this.http.post<ProjectOpenResult>('/api/projects/ensure', {
+      name,
+      workspaceId
+    });
+  }
+
+  saveProjectAs(projectId: string): Observable<ProjectOpenResult> {
+    return this.http.post<ProjectOpenResult>(`/api/projects/${encodeURIComponent(projectId)}/save-as`, {});
+  }
+
+  renameProject(projectId: string, name: string): Observable<ProjectSummary> {
+    return this.http.patch<ProjectSummary>(`/api/projects/${encodeURIComponent(projectId)}`, { name });
   }
 }

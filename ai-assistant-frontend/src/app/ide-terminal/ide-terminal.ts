@@ -114,6 +114,9 @@ export class IdeTerminalComponent implements AfterViewInit, OnChanges, OnDestroy
   private resizeObserver: ResizeObserver | null = null;
   private ready = false;
   private sending = false;
+  /** Plain-text copy of the session so the assistant can explain what happened. */
+  private transcript = '';
+  private lastCmd = '';
 
   constructor(
     private terminal: TerminalService,
@@ -189,10 +192,12 @@ export class IdeTerminalComponent implements AfterViewInit, OnChanges, OnDestroy
     this.statusChange.emit('connecting');
     this.term?.reset();
     this.line = '';
+    this.transcript = '';
     this.ngZone.runOutsideAngular(() => {
       this.terminal.connect(
         (chunk) => {
           this.term?.write(chunk);
+          this.appendTranscript(chunk);
         },
         (status) => {
           this.ngZone.run(() => this.statusChange.emit(status));
@@ -221,41 +226,71 @@ export class IdeTerminalComponent implements AfterViewInit, OnChanges, OnDestroy
       return;
     }
 
-    // Echo once in the output pane (input is separate from xterm)
-    if (cmd.length) {
-      this.term?.write(`${cmd}\r\n`);
-    }
-
     this.line = '';
+    this.runCommand(cmd);
+  }
+
+  /** Run a command from outside (e.g. COMPOSER "run") — connects if needed. */
+  runCommand(cmd: string): Promise<boolean> {
+    const text = (cmd || '').trim();
+    if (!text) {
+      return Promise.resolve(false);
+    }
+    if (text.length) {
+      this.term?.write(`${text}\r\n`);
+      this.appendTranscript(`$ ${text}\n`);
+      this.lastCmd = text;
+    }
     this.sending = true;
 
-    if (!this.terminal.isConnected) {
-      this.connect();
+    return new Promise((resolve) => {
+      const finish = (ok: boolean) => {
+        this.sending = false;
+        this.focus();
+        resolve(ok);
+      };
+
       const trySend = (n: number) => {
         if (this.terminal.isConnected) {
-          this.terminal.sendLine(cmd);
-          this.sending = false;
+          this.terminal.sendLine(text);
+          setTimeout(() => finish(true), 80);
           return;
         }
-        if (n < 40) {
-          setTimeout(() => trySend(n + 1), 50);
+        if (n === 0) {
+          this.connect();
+        }
+        if (n < 60) {
+          setTimeout(() => trySend(n + 1), 100);
         } else {
-          this.sending = false;
+          finish(false);
         }
       };
       trySend(0);
-      return;
-    }
-
-    this.terminal.sendLine(cmd);
-    setTimeout(() => {
-      this.sending = false;
-      this.focus();
-    }, 80);
+    });
   }
 
   clear() {
     this.term?.clear();
+    this.transcript = '';
+  }
+
+  /** Tail of the session, ANSI stripped — used to answer "did it work?". */
+  recentOutput(maxChars = 8000): string {
+    const text = this.transcript;
+    return text.length > maxChars ? text.slice(-maxChars) : text;
+  }
+
+  get lastCommand(): string {
+    return this.lastCmd;
+  }
+
+  private appendTranscript(chunk: string) {
+    if (!chunk) {
+      return;
+    }
+    // eslint-disable-next-line no-control-regex
+    const plain = chunk.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\r/g, '');
+    this.transcript = (this.transcript + plain).slice(-60000);
   }
 
   focus() {

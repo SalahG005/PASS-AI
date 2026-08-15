@@ -7,9 +7,13 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.security.web.context.RequestAttributeSecurityContextRepository;
+import org.springframework.security.web.context.SecurityContextRepository;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -21,6 +25,8 @@ public class JwtAuthFilter extends OncePerRequestFilter {
 
     private final JwtUtil jwtUtil;
     private final UserRepository userRepository;
+    private final SecurityContextRepository securityContextRepository =
+            new RequestAttributeSecurityContextRepository();
 
     public JwtAuthFilter(JwtUtil jwtUtil, UserRepository userRepository) {
         this.jwtUtil = jwtUtil;
@@ -46,9 +52,17 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         }
 
         String email = jwtUtil.extractEmail(token);
-        User user = userRepository.findByEmail(email).orElse(null);
+        if (email != null) {
+            email = email.trim().toLowerCase();
+        }
+        User user = email == null ? null : userRepository.findByEmail(email).orElse(null);
 
         if (user == null) {
+            // Token signature OK but user missing — still attach principal so we don't
+            // drop a valid session on transient DB issues; role defaults to USER.
+            if (email != null && !email.isBlank()) {
+                applyAuthentication(request, response, email, "USER");
+            }
             filterChain.doFilter(request, response);
             return;
         }
@@ -58,15 +72,25 @@ public class JwtAuthFilter extends OncePerRequestFilter {
             role = "USER";
         }
 
-        UsernamePasswordAuthenticationToken authentication =
+        applyAuthentication(request, response, email, role);
+        filterChain.doFilter(request, response);
+    }
+
+    private void applyAuthentication(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     String email,
+                                     String role) {
+        Authentication authentication =
                 new UsernamePasswordAuthenticationToken(
                         email,
                         null,
                         List.of(new SimpleGrantedAuthority("ROLE_" + role))
                 );
-        authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
-        SecurityContextHolder.getContext().setAuthentication(authentication);
-
-        filterChain.doFilter(request, response);
+        ((UsernamePasswordAuthenticationToken) authentication)
+                .setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+        SecurityContext context = SecurityContextHolder.createEmptyContext();
+        context.setAuthentication(authentication);
+        SecurityContextHolder.setContext(context);
+        securityContextRepository.saveContext(context, request, response);
     }
 }

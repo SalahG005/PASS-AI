@@ -42,6 +42,42 @@ html[data-theme='light'] {
 	box-sizing: border-box;
 }
 
+/* Slim, arrow-less scrollbars everywhere (removes the chunky Windows
+   scrollbars and the up/down spinner buttons on textareas and tab bars). */
+* {
+	scrollbar-width: thin;
+	scrollbar-color: rgba(140, 150, 170, 0.35) transparent;
+}
+
+*::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+	background: rgba(140, 150, 170, 0.35);
+	border-radius: 8px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+	background: rgba(140, 150, 170, 0.55);
+}
+
+/* Kill the up/down (and left/right) arrow buttons on the scrollbars */
+*::-webkit-scrollbar-button {
+	display: none;
+	width: 0;
+	height: 0;
+}
+
+*::-webkit-scrollbar-corner {
+	background: transparent;
+}
+
 html,
 body {
 	margin: 0;

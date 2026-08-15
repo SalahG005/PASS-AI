@@ -1,4 +1,9 @@
 # Modern Explorer-style folder picker (IFileOpenDialog / Vista+)
+param(
+    [ValidateSet('open', 'save')]
+    [string]$Mode = 'open'
+)
+
 $ErrorActionPreference = 'Stop'
 
 if (-not ('PassAi.ModernFolderPicker' -as [type])) {
@@ -58,7 +63,7 @@ namespace PassAi {
         private const uint FOS_PATHMUSTEXIST = 0x00000800;
         private const uint SIGDN_FILESYSPATH = 0x80058000;
 
-        public static string SelectFolder(string title) {
+        public static string SelectFolder(string title, string okButtonLabel, string folderLabel) {
             var dialog = (IFileDialog)new FileOpenDialogRCW();
             uint options;
             dialog.GetOptions(out options);
@@ -66,6 +71,12 @@ namespace PassAi {
             dialog.SetOptions(options);
             if (!string.IsNullOrEmpty(title)) {
                 dialog.SetTitle(title);
+            }
+            if (!string.IsNullOrEmpty(okButtonLabel)) {
+                dialog.SetOkButtonLabel(okButtonLabel);
+            }
+            if (!string.IsNullOrEmpty(folderLabel)) {
+                dialog.SetFileNameLabel(folderLabel);
             }
             int hr = dialog.Show(IntPtr.Zero);
             if (hr != 0) {
@@ -84,7 +95,11 @@ namespace PassAi {
 '@
 }
 
-$path = [PassAi.ModernFolderPicker]::SelectFolder('Select the real project folder for PASS AI')
+if ($Mode -eq 'save') {
+    $path = [PassAi.ModernFolderPicker]::SelectFolder('Enregistrer sous', 'Enregistrer', 'Dossier du projet :')
+} else {
+    $path = [PassAi.ModernFolderPicker]::SelectFolder('Select the real project folder for PASS AI', 'Selectionner un dossier', 'Dossier :')
+}
 if ($path) {
     Write-Output $path
 }

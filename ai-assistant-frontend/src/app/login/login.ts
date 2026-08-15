@@ -1,7 +1,7 @@
 import { ChangeDetectorRef, Component, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { HttpErrorResponse } from '@angular/common/http';
-import { Router, RouterLink } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { finalize } from 'rxjs';
 import { Auth } from '../auth';
 import { ThemeService } from '../theme';
@@ -22,6 +22,7 @@ export class Login implements OnInit {
   constructor(
     private auth: Auth,
     private router: Router,
+    private route: ActivatedRoute,
     public theme: ThemeService,
     private toast: ToastService,
     private cdr: ChangeDetectorRef
@@ -30,6 +31,10 @@ export class Login implements OnInit {
   ngOnInit() {
     if (this.auth.isLoggedIn()) {
       this.router.navigateByUrl('/chat', { replaceUrl: true });
+      return;
+    }
+    if (this.route.snapshot.queryParamMap.get('reason') === 'session') {
+      this.errorMessage = 'Session expired — please log in again.';
     }
   }
 

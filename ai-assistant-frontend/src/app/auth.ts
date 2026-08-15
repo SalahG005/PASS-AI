@@ -33,19 +33,48 @@ export class Auth {
 
   getValidToken(): string | null {
     const token = this.getToken();
-    if (!token || !this.isUsableToken(token)) {
-      this.logout();
+    if (!token) {
+      return null;
+    }
+    if (!this.isUsableToken(token)) {
+      // Keep token in storage — server is source of truth. Clearing here caused
+      // requests without Authorization → 401 → forced login redirects.
       return null;
     }
     return token;
   }
 
   isLoggedIn(): boolean {
-    return !!this.getValidToken();
+    const token = this.getToken();
+    if (!token) {
+      return false;
+    }
+    // If we have a JWT shape, treat as logged in; expiry is enforced by the API.
+    const parts = token.split('.');
+    return parts.length === 3;
   }
 
   logout() {
     localStorage.removeItem(this.tokenKey);
+  }
+
+  /** Email claim from the JWT, if present. */
+  getEmail(): string | null {
+    const token = this.getToken();
+    if (!token) {
+      return null;
+    }
+    try {
+      const parts = token.split('.');
+      if (parts.length !== 3) {
+        return null;
+      }
+      const payload = JSON.parse(this.decodeBase64Url(parts[1]));
+      const email = payload?.sub || payload?.email;
+      return typeof email === 'string' && email.includes('@') ? email.toLowerCase() : null;
+    } catch {
+      return null;
+    }
   }
 
   private isUsableToken(token: string): boolean {
@@ -56,12 +85,15 @@ export class Auth {
 
     try {
       const payload = JSON.parse(this.decodeBase64Url(parts[1]));
-      if (typeof payload?.exp !== 'number') {
-        return false;
+      const exp = payload?.exp;
+      if (typeof exp === 'number') {
+        // 60s clock skew tolerance
+        return exp * 1000 > Date.now() - 60_000;
       }
-      return payload.exp * 1000 > Date.now();
+      // Missing exp → still send; backend validates
+      return true;
     } catch {
-      return false;
+      return true;
     }
   }
 

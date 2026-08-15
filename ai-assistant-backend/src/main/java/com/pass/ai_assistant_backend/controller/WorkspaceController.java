@@ -4,6 +4,7 @@ import com.pass.ai_assistant_backend.dto.FileContentDto;
 import com.pass.ai_assistant_backend.dto.FileNodeDto;
 import com.pass.ai_assistant_backend.dto.ProblemDto;
 import com.pass.ai_assistant_backend.dto.SearchHitDto;
+import com.pass.ai_assistant_backend.project.ProjectService;
 import com.pass.ai_assistant_backend.service.WorkspaceService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -22,13 +23,25 @@ import java.util.Map;
 public class WorkspaceController {
 
     private final WorkspaceService workspaceService;
+    private final ProjectService projectService;
 
-    public WorkspaceController(WorkspaceService workspaceService) {
+    public WorkspaceController(WorkspaceService workspaceService, ProjectService projectService) {
         this.workspaceService = workspaceService;
+        this.projectService = projectService;
     }
 
     private String email(Authentication authentication) {
         return authentication.getName();
+    }
+
+    private void touchProject(String email, String workspaceId) {
+        if (workspaceId == null || workspaceId.isBlank()) {
+            return;
+        }
+        try {
+            projectService.touchActivity(email, workspaceId);
+        } catch (Exception ignored) {
+        }
     }
 
     @GetMapping("/tree")
@@ -63,7 +76,9 @@ public class WorkspaceController {
             @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
     ) {
         try {
-            return ResponseEntity.ok(workspaceService.writeFile(email(authentication), workspaceId, body.getPath(), body.getContent()));
+            FileContentDto saved = workspaceService.writeFile(email(authentication), workspaceId, body.getPath(), body.getContent());
+            touchProject(email(authentication), workspaceId);
+            return ResponseEntity.ok(saved);
         } catch (SecurityException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(e.getMessage());
         } catch (IOException e) {
@@ -369,6 +384,71 @@ public class WorkspaceController {
             return ResponseEntity.ok(Map.of("output", output));
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+        }
+    }
+
+    /** Seed Maven Wrapper into a folder that has pom.xml (no global mvn required). */
+    @PostMapping("/ensure-maven-wrapper")
+    public ResponseEntity<?> ensureMavenWrapper(
+            Authentication authentication,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            String dir = body == null ? "" : body.getOrDefault("path", "");
+            return ResponseEntity.ok(workspaceService.ensureMavenWrapper(email(authentication), workspaceId, dir));
+        } catch (NoSuchFileException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("ok", false, "error", e.getMessage()));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("ok", false, "error", e.getMessage()));
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("ok", false, "error", e.getMessage()));
+        }
+    }
+
+    /** Commit the workspace so automatic edits can be undone. */
+    @PostMapping("/snapshot")
+    public ResponseEntity<?> snapshot(
+            Authentication authentication,
+            @RequestBody(required = false) Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            String message = body == null ? null : body.get("message");
+            return ResponseEntity.ok(workspaceService.snapshot(email(authentication), workspaceId, message));
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("ok", false, "error", e.getMessage()));
+        }
+    }
+
+    /** Undo changes back to a snapshot (given commit, else last). */
+    @PostMapping("/revert")
+    public ResponseEntity<?> revert(
+            Authentication authentication,
+            @RequestBody(required = false) Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            String commit = body == null ? null : body.get("commit");
+            return ResponseEntity.ok(workspaceService.revertToSnapshot(email(authentication), workspaceId, commit));
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("ok", false, "error", e.getMessage()));
+        }
+    }
+
+    /** Detect project type and run a non-interactive build, returning output + exit code. */
+    @PostMapping("/build")
+    public ResponseEntity<?> build(
+            Authentication authentication,
+            @RequestHeader(value = "X-Workspace-Id", required = false) String workspaceId
+    ) {
+        try {
+            return ResponseEntity.ok(workspaceService.runBuild(email(authentication), workspaceId));
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("ok", false, "error", e.getMessage()));
         }
     }
 }

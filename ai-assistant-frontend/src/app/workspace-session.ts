@@ -1,37 +1,79 @@
 import { Injectable } from '@angular/core';
 
-const STORAGE_KEY = 'pass_workspace_id';
+const ACTIVE_PROJECT_KEY = 'pass_active_project_id';
+const LEGACY_SESSION_KEY = 'pass_workspace_id';
 
 @Injectable({ providedIn: 'root' })
 export class WorkspaceSession {
   private workspaceId: string;
+  private requestedFreshWindow = false;
 
   constructor() {
-    // Prefer URL ?ws= for new windows, else keep/create a session id for this browser tab
     const fromUrl = new URLSearchParams(window.location.search).get('ws');
-    if (fromUrl && /^[A-Za-z0-9_-]{4,64}$/.test(fromUrl)) {
+    if (fromUrl && this.isValidId(fromUrl)) {
       this.workspaceId = fromUrl;
-      sessionStorage.setItem(STORAGE_KEY, fromUrl);
+      // Keep the id local to this window so it never hijacks the active
+      // project of the window that spawned it.
+      this.requestedFreshWindow = true;
+      sessionStorage.setItem(LEGACY_SESSION_KEY, fromUrl);
       return;
     }
 
-    const existing = sessionStorage.getItem(STORAGE_KEY);
-    if (existing && /^[A-Za-z0-9_-]{4,64}$/.test(existing)) {
+    const active = localStorage.getItem(ACTIVE_PROJECT_KEY);
+    if (active && this.isValidId(active)) {
+      this.workspaceId = active;
+      sessionStorage.setItem(LEGACY_SESSION_KEY, active);
+      return;
+    }
+
+    const existing = sessionStorage.getItem(LEGACY_SESSION_KEY);
+    if (existing && this.isValidId(existing)) {
       this.workspaceId = existing;
       return;
     }
 
+    // Temporary id until /api/projects/ensure or create assigns a durable project
     this.workspaceId = this.createId();
-    sessionStorage.setItem(STORAGE_KEY, this.workspaceId);
+    sessionStorage.setItem(LEGACY_SESSION_KEY, this.workspaceId);
   }
 
   get id(): string {
     return this.workspaceId;
   }
 
+  /** True when this window was opened asking for its own empty workspace. */
+  get isFreshWindow(): boolean {
+    return this.requestedFreshWindow;
+  }
+
+  /** Switch the active project for this browser (persisted across reloads). */
+  setActiveProject(projectId: string) {
+    if (!this.isValidId(projectId)) {
+      throw new Error('Invalid project id');
+    }
+    this.workspaceId = projectId;
+    this.requestedFreshWindow = false;
+    this.persist(projectId);
+  }
+
+  clearActiveProject() {
+    this.workspaceId = this.createId();
+    sessionStorage.setItem(LEGACY_SESSION_KEY, this.workspaceId);
+    localStorage.removeItem(ACTIVE_PROJECT_KEY);
+  }
+
   /** Create a brand-new empty workspace id (used by New window). */
   createFreshId(): string {
     return this.createId();
+  }
+
+  private persist(projectId: string) {
+    sessionStorage.setItem(LEGACY_SESSION_KEY, projectId);
+    localStorage.setItem(ACTIVE_PROJECT_KEY, projectId);
+  }
+
+  private isValidId(value: string): boolean {
+    return /^[A-Za-z0-9_-]{4,64}$/.test(value);
   }
 
   private createId(): string {

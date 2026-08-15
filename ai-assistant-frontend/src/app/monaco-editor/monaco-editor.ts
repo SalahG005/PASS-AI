@@ -46,12 +46,14 @@ interface MonacoEditor {
   getValue: () => string;
   setValue: (value: string) => void;
   getModel: () => MonacoModel | null;
+  getSelection: () => { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number } | null;
   updateOptions: (options: Record<string, unknown>) => void;
   layout: () => void;
   focus: () => void;
   dispose: () => void;
   onDidChangeModelContent: (listener: () => void) => { dispose: () => void };
   onDidChangeCursorPosition: (listener: (e: { position: { lineNumber: number; column: number } }) => void) => { dispose: () => void };
+  onDidChangeCursorSelection: (listener: () => void) => { dispose: () => void };
   addCommand: (keybinding: number, handler: () => void) => string | null;
 }
 
@@ -84,6 +86,7 @@ export class MonacoEditorComponent implements AfterViewInit, OnChanges, OnDestro
   @Output() valueChange = new EventEmitter<string>();
   @Output() saveRequest = new EventEmitter<void>();
   @Output() cursorChange = new EventEmitter<{ line: number; column: number }>();
+  @Output() selectionChange = new EventEmitter<string>();
 
   private editor: MonacoEditor | null = null;
   private monaco: MonacoNamespace | null = null;
@@ -91,6 +94,7 @@ export class MonacoEditorComponent implements AfterViewInit, OnChanges, OnDestro
   private resizeObserver: ResizeObserver | null = null;
   private contentDisposable: { dispose: () => void } | null = null;
   private cursorDisposable: { dispose: () => void } | null = null;
+  private selectionDisposable: { dispose: () => void } | null = null;
   private readonly themeService = inject(ThemeService);
 
   constructor() {
@@ -135,6 +139,7 @@ export class MonacoEditorComponent implements AfterViewInit, OnChanges, OnDestro
   ngOnDestroy() {
     this.contentDisposable?.dispose();
     this.cursorDisposable?.dispose();
+    this.selectionDisposable?.dispose();
     this.resizeObserver?.disconnect();
     this.editor?.dispose();
     this.editor = null;
@@ -142,6 +147,35 @@ export class MonacoEditorComponent implements AfterViewInit, OnChanges, OnDestro
 
   focus() {
     this.editor?.focus();
+  }
+
+  /** Current non-empty selection text, or empty string. */
+  getSelectedText(): string {
+    if (!this.editor) {
+      return '';
+    }
+    const sel = this.editor.getSelection();
+    const model = this.editor.getModel();
+    if (!sel || !model) {
+      return '';
+    }
+    if (sel.startLineNumber === sel.endLineNumber && sel.startColumn === sel.endColumn) {
+      return '';
+    }
+    const value = model.getValue();
+    // Approximate via full value + line offsets (Monaco model usually has getValueInRange; fall back)
+    const modelAny = model as MonacoModel & {
+      getValueInRange?: (range: {
+        startLineNumber: number;
+        startColumn: number;
+        endLineNumber: number;
+        endColumn: number;
+      }) => string;
+    };
+    if (typeof modelAny.getValueInRange === 'function') {
+      return modelAny.getValueInRange(sel) || '';
+    }
+    return value;
   }
 
   private async initMonaco() {
@@ -215,6 +249,10 @@ export class MonacoEditorComponent implements AfterViewInit, OnChanges, OnDestro
 
     this.cursorDisposable = this.editor.onDidChangeCursorPosition((e) => {
       this.cursorChange.emit({ line: e.position.lineNumber, column: e.position.column });
+    });
+
+    this.selectionDisposable = this.editor.onDidChangeCursorSelection(() => {
+      this.selectionChange.emit(this.getSelectedText());
     });
 
     this.editor.addCommand(this.monaco.KeyMod.CtrlCmd | this.monaco.KeyCode.KeyS, () => {

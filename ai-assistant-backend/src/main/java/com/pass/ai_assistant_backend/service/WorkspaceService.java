@@ -21,6 +21,7 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
@@ -97,11 +98,26 @@ public class WorkspaceService {
      * (same PC as the user for local PASS AI), then binds that folder.
      */
     public Path pickAndBindLocalFolder(String email, String workspaceId) throws IOException {
-        Path picked = pickFolderNative();
+        Path picked = pickFolderNative(false);
         if (picked == null) {
             return null;
         }
         return bindLocalFolder(email, workspaceId, picked.toString());
+    }
+
+    /** Opens the native folder picker without binding. */
+    public Path pickFolderOnly() throws IOException {
+        return pickFolderNative(false);
+    }
+
+    /** Opens a Save As-styled folder picker for relocating a complete project. */
+    public Path pickProjectSaveLocation() throws IOException {
+        return pickFolderNative(true);
+    }
+
+    /** Validates an absolute folder path against sandbox rules and returns the normalized path. */
+    public Path validateExternalFolderPublic(String absolutePath) throws IOException {
+        return validateExternalFolder(absolutePath);
     }
 
     private Path getBoundRoot(String email, String workspaceId) throws IOException {
@@ -189,16 +205,16 @@ public class WorkspaceService {
                 || p.startsWith("/System");
     }
 
-    private Path pickFolderNative() throws IOException {
+    private Path pickFolderNative(boolean saveAs) throws IOException {
         String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
-            return pickFolderWindows();
+            return pickFolderWindows(saveAs);
         }
         // Fallback: no GUI picker — caller should use bind with an explicit path
         return null;
     }
 
-    private Path pickFolderWindows() throws IOException {
+    private Path pickFolderWindows(boolean saveAs) throws IOException {
         // Modern Explorer-style dialog (IFileOpenDialog), not the old tree FolderBrowserDialog
         Path script = extractPickerScript();
         ProcessBuilder pb = new ProcessBuilder(
@@ -206,7 +222,8 @@ public class WorkspaceService {
                 "-NoProfile",
                 "-STA",
                 "-ExecutionPolicy", "Bypass",
-                "-File", script.toAbsolutePath().toString()
+                "-File", script.toAbsolutePath().toString(),
+                saveAs ? "save" : "open"
         );
         pb.redirectErrorStream(true);
         Process process = pb.start();
@@ -722,6 +739,304 @@ public class WorkspaceService {
         int code = process.waitFor();
         output.add("Process exited with code " + code);
         return output;
+    }
+
+    /**
+     * Copy Maven Wrapper (mvnw.cmd / mvnw + .mvn/wrapper) into a project folder so Spring Boot
+     * can run without a global {@code mvn} install. Source is the backend's own wrapper.
+     *
+     * @param projectDir relative dir containing pom.xml ("" or "backend")
+     */
+    public Map<String, Object> ensureMavenWrapper(String email, String workspaceId, String projectDir)
+            throws IOException {
+        Path targetDir = resolveSafe(email, workspaceId, projectDir == null ? "" : projectDir);
+        Files.createDirectories(targetDir);
+        Path pom = targetDir.resolve("pom.xml");
+        if (!Files.isRegularFile(pom)) {
+            throw new NoSuchFileException("pom.xml not found in " + (projectDir == null || projectDir.isBlank() ? "." : projectDir));
+        }
+
+        Path sourceRoot = findBackendMavenWrapperRoot();
+        List<String> copied = new ArrayList<>();
+        String[] names = {"mvnw.cmd", "mvnw"};
+        for (String name : names) {
+            Path src = sourceRoot.resolve(name);
+            if (Files.isRegularFile(src)) {
+                Path dest = targetDir.resolve(name);
+                Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
+                copied.add(toRelative(resolveUserRoot(email, workspaceId), dest));
+            }
+        }
+        Path wrapperSrc = sourceRoot.resolve(".mvn").resolve("wrapper");
+        if (Files.isDirectory(wrapperSrc)) {
+            Path wrapperDest = targetDir.resolve(".mvn").resolve("wrapper");
+            Files.createDirectories(wrapperDest);
+            try (Stream<Path> stream = Files.list(wrapperSrc)) {
+                for (Path src : stream.toList()) {
+                    if (Files.isRegularFile(src)) {
+                        Path dest = wrapperDest.resolve(src.getFileName().toString());
+                        Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
+                        copied.add(toRelative(resolveUserRoot(email, workspaceId), dest));
+                    }
+                }
+            }
+        }
+        // Ensure Windows can execute mvnw.cmd
+        Path mvnwCmd = targetDir.resolve("mvnw.cmd");
+        boolean ready = Files.isRegularFile(mvnwCmd) || Files.isRegularFile(targetDir.resolve("mvnw"));
+        return Map.of(
+                "ok", ready,
+                "copied", copied,
+                "command", Files.isRegularFile(mvnwCmd) ? ".\\mvnw.cmd spring-boot:run" : "./mvnw spring-boot:run",
+                "projectDir", projectDir == null ? "" : projectDir.replace('\\', '/')
+        );
+    }
+
+    // ---- Auto-fix / verify loop support: git snapshots + build runner ----
+
+    /**
+     * Commit the whole workspace so a later revert can undo automatic edits.
+     * Uses per-command git identity (never touches global config). Safe when git
+     * is not installed — returns {@code gitAvailable:false} instead of throwing.
+     */
+    public Map<String, Object> snapshot(String email, String workspaceId, String message) throws IOException {
+        Path dir = resolveUserRoot(email, workspaceId);
+        String msg = (message == null || message.isBlank()) ? "PASS AI snapshot" : message.trim();
+
+        ProcResult probe = runProcess(dir, 120, List.of("git", "--version"));
+        if (!probe.started()) {
+            return Map.of("ok", false, "gitAvailable", false,
+                    "message", "git is not installed — automatic undo is unavailable");
+        }
+
+        boolean hasRepo = Files.isDirectory(dir.resolve(".git"));
+        if (!hasRepo) {
+            runProcess(dir, 120, List.of("git", "init"));
+            runProcess(dir, 120, List.of("git", "symbolic-ref", "HEAD", "refs/heads/main"));
+            ensureGitIgnore(dir);
+        }
+        runProcess(dir, 300, List.of("git", "add", "-A"));
+        ProcResult commit = runProcess(dir, 300, List.of(
+                "git", "-c", "user.email=passai@local", "-c", "user.name=PASS AI",
+                "commit", "-m", msg, "--allow-empty"));
+        ProcResult head = runProcess(dir, 60, List.of("git", "rev-parse", "HEAD"));
+        String hash = head.output().isEmpty() ? "" : head.output().get(0).trim();
+
+        return Map.of(
+                "ok", commit.exitCode() == 0 || !hash.isBlank(),
+                "gitAvailable", true,
+                "created", !hasRepo,
+                "commit", hash,
+                "message", msg
+        );
+    }
+
+    /** Discard all changes back to a snapshot (given commit, else last commit). */
+    public Map<String, Object> revertToSnapshot(String email, String workspaceId, String commit) throws IOException {
+        Path dir = resolveUserRoot(email, workspaceId);
+        if (!Files.isDirectory(dir.resolve(".git"))) {
+            return Map.of("ok", false, "message", "No snapshot to revert to (git repo not initialized)");
+        }
+        String target = (commit == null || commit.isBlank()) ? "HEAD" : commit.trim();
+        if (!target.matches("[A-Za-z0-9_./-]{1,120}")) {
+            return Map.of("ok", false, "message", "Invalid commit reference");
+        }
+        ProcResult reset = runProcess(dir, 120, List.of("git", "reset", "--hard", target));
+        runProcess(dir, 120, List.of("git", "clean", "-fd"));
+        return Map.of(
+                "ok", reset.exitCode() == 0,
+                "message", reset.exitCode() == 0 ? "Reverted to " + target : "Revert failed"
+        );
+    }
+
+    /**
+     * Detect the project type and run a NON-interactive build, capturing output + exit code.
+     * Maven (via wrapper) → compile; Node → install (if needed) + build; static → nothing to build.
+     */
+    public Map<String, Object> runBuild(String email, String workspaceId) throws IOException {
+        Path userRoot = resolveUserRoot(email, workspaceId);
+        boolean isWindows = System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("win");
+
+        Path pom = findFile(userRoot, "pom.xml");
+        if (pom != null) {
+            Path projectDir = pom.getParent();
+            if (!Files.isRegularFile(projectDir.resolve("mvnw.cmd")) && !Files.isRegularFile(projectDir.resolve("mvnw"))) {
+                try {
+                    ensureMavenWrapper(email, workspaceId, toRelative(userRoot, projectDir));
+                } catch (Exception ignored) {
+                    // fall through; build will report if mvn missing
+                }
+            }
+            List<String> cmd = isWindows
+                    ? List.of("cmd.exe", "/c", "mvnw.cmd", "-q", "-DskipTests", "compile")
+                    : List.of("sh", "-c", "./mvnw -q -DskipTests compile");
+            ProcResult r = runProcess(projectDir, 600, cmd);
+            return buildResult(r, "mvnw compile", toRelative(userRoot, projectDir));
+        }
+
+        Path pkg = findFile(userRoot, "package.json");
+        if (pkg != null) {
+            Path projectDir = pkg.getParent();
+            String pkgText = Files.readString(pkg, StandardCharsets.UTF_8);
+            boolean hasBuildScript = pkgText.matches("(?s).*\"scripts\"\\s*:\\s*\\{[^}]*\"build\"\\s*:.*");
+            if (!Files.isDirectory(projectDir.resolve("node_modules"))) {
+                List<String> install = isWindows
+                        ? List.of("cmd.exe", "/c", "npm", "install")
+                        : List.of("sh", "-c", "npm install");
+                ProcResult installRes = runProcess(projectDir, 600, install);
+                if (installRes.exitCode() != 0) {
+                    return buildResult(installRes, "npm install", toRelative(userRoot, projectDir));
+                }
+            }
+            List<String> cmd;
+            String label;
+            if (hasBuildScript) {
+                cmd = isWindows ? List.of("cmd.exe", "/c", "npm", "run", "build")
+                        : List.of("sh", "-c", "npm run build");
+                label = "npm run build";
+            } else {
+                cmd = isWindows ? List.of("cmd.exe", "/c", "npx", "--yes", "tsc", "--noEmit")
+                        : List.of("sh", "-c", "npx --yes tsc --noEmit");
+                label = "tsc --noEmit";
+            }
+            ProcResult r = runProcess(projectDir, 600, cmd);
+            return buildResult(r, label, toRelative(userRoot, projectDir));
+        }
+
+        if (findFile(userRoot, "index.html") != null) {
+            return Map.of("ok", true, "command", "(static site)", "exitCode", 0,
+                    "output", List.of("Static HTML site — nothing to build."),
+                    "tail", "Static HTML site — nothing to build.", "projectDir", "");
+        }
+
+        return Map.of("ok", false, "command", "(none)", "exitCode", -1,
+                "output", List.of("No buildable project found (need pom.xml, package.json, or index.html)."),
+                "tail", "No buildable project found (need pom.xml, package.json, or index.html).",
+                "projectDir", "");
+    }
+
+    private Map<String, Object> buildResult(ProcResult r, String command, String projectDir) {
+        boolean ok = r.started() && r.exitCode() == 0;
+        List<String> out = r.output();
+        String tail = out.isEmpty() ? "" : String.join("\n", out.subList(Math.max(0, out.size() - 60), out.size()));
+        if (!r.started()) {
+            String miss = command + " could not start (tool not installed / not on PATH).";
+            return Map.of("ok", false, "command", command, "exitCode", -1,
+                    "output", List.of(miss), "tail", miss, "projectDir", projectDir == null ? "" : projectDir);
+        }
+        return Map.of("ok", ok, "command", command, "exitCode", r.exitCode(),
+                "output", out, "tail", tail, "projectDir", projectDir == null ? "" : projectDir);
+    }
+
+    private void ensureGitIgnore(Path dir) {
+        Path gi = dir.resolve(".gitignore");
+        if (Files.exists(gi)) {
+            return;
+        }
+        try {
+            Files.writeString(gi, String.join("\n",
+                    "node_modules/", "target/", "dist/", "build/", ".gradle/", "*.class", ".DS_Store", ""),
+                    StandardCharsets.UTF_8);
+        } catch (IOException ignored) {
+        }
+    }
+
+    /** Shallow search skipping heavy/vendor dirs; returns the shallowest match. */
+    private Path findFile(Path root, String name) throws IOException {
+        if (!Files.isDirectory(root)) {
+            return null;
+        }
+        final Path[] found = {null};
+        final int maxDepth = 4;
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path d, BasicFileAttributes attrs) {
+                String n = d.getFileName() == null ? "" : d.getFileName().toString();
+                if (!d.equals(root) && (n.equals("node_modules") || n.equals("target") || n.equals(".git")
+                        || n.equals("dist") || n.equals("build") || n.equals(".mvn"))) {
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                if (root.relativize(d).getNameCount() > maxDepth) {
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (file.getFileName().toString().equals(name)) {
+                    if (found[0] == null
+                            || root.relativize(file).getNameCount() < root.relativize(found[0]).getNameCount()) {
+                        found[0] = file;
+                    }
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return found[0];
+    }
+
+    private ProcResult runProcess(Path dir, int timeoutSeconds, List<String> command) {
+        List<String> output = new ArrayList<>();
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.directory(dir.toFile());
+        pb.redirectErrorStream(true);
+        Process process;
+        try {
+            process = pb.start();
+        } catch (IOException e) {
+            return new ProcResult(false, -1, output);
+        }
+        try (var reader = process.inputReader(StandardCharsets.UTF_8)) {
+            String line;
+            int count = 0;
+            while ((line = reader.readLine()) != null) {
+                if (count < 600) {
+                    output.add(line);
+                }
+                count++;
+            }
+            boolean done = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+            if (!done) {
+                process.destroyForcibly();
+                output.add("Process timed out after " + timeoutSeconds + "s and was terminated.");
+                return new ProcResult(true, -1, output);
+            }
+            return new ProcResult(true, process.exitValue(), output);
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            process.destroyForcibly();
+            output.add("Error: " + (e.getMessage() != null ? e.getMessage() : e.toString()));
+            return new ProcResult(true, -1, output);
+        }
+    }
+
+    private record ProcResult(boolean started, int exitCode, List<String> output) {
+    }
+
+    private Path findBackendMavenWrapperRoot() throws IOException {
+        Path cwd = Paths.get("").toAbsolutePath().normalize();
+        if (Files.isRegularFile(cwd.resolve("mvnw.cmd")) || Files.isRegularFile(cwd.resolve("mvnw"))) {
+            return cwd;
+        }
+        Path parent = cwd.getParent();
+        if (parent != null) {
+            Path backend = parent.resolve("ai-assistant-backend");
+            if (Files.isRegularFile(backend.resolve("mvnw.cmd"))) {
+                return backend;
+            }
+        }
+        // Fall back: search upward a few levels
+        Path p = cwd;
+        for (int i = 0; i < 5 && p != null; i++) {
+            if (Files.isRegularFile(p.resolve("mvnw.cmd"))) {
+                return p;
+            }
+            p = p.getParent();
+        }
+        throw new NoSuchFileException("Maven wrapper (mvnw.cmd) not found next to the backend");
     }
 
     private void analyzeJava(Path file, String relative, List<ProblemDto> problems) throws IOException {

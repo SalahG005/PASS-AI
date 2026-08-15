@@ -11,16 +11,35 @@ import { ThemeService } from '../theme';
 import { WorkspaceSession } from '../workspace-session';
 import {
   BindingResult,
+  BuildResult,
   ProblemItem,
+  ProjectOpenResult,
+  ProjectSummary,
   SearchHit,
   UploadResult,
   WorkspaceApi,
   WorkspaceNode
 } from '../workspace-api';
+import { firstValueFrom, Subscription } from 'rxjs';
+import { AiApi, AgentToolStep, ChatHistoryItem, ConversationSummary, FileProposal, ProjectPlan, ReviewFinding, SpecializedAgentMode } from '../ai-api';
 
 export type ActivityView = 'files' | 'search' | 'git' | 'debug' | 'extensions';
 export type BottomPanelTab = 'terminal' | 'problems' | 'output' | 'debug';
-export type AiTab = 'chat' | 'composer' | 'agent';
+export type AiTab = 'chat' | 'history';
+
+/** Capability level of the single assistant thread. */
+export type AssistantMode = 'ask' | 'build';
+/** RAG: Auto indexes when needed and uses RAG; On always uses RAG; Off never. */
+export type RagMode = 'auto' | 'on' | 'off';
+
+export const SPECIALIZED_AGENTS: { id: SpecializedAgentMode; label: string; hint: string }[] = [
+  { id: 'scaffold', label: 'Scaffold', hint: 'Plan + multi-file project (Composer)' },
+  { id: 'code', label: 'Code', hint: 'Edit code → Diff Apply' },
+  { id: 'review', label: 'Review', hint: 'Read-only findings' },
+  { id: 'test', label: 'Test', hint: 'Write & run tests' },
+  { id: 'docs', label: 'Docs', hint: 'Generate documentation' },
+  { id: 'research', label: 'Research', hint: 'Explain the codebase' }
+];
 
 export interface EditorTab {
   id: string;
@@ -35,6 +54,20 @@ export interface ChatMessage {
   id: number;
   role: 'assistant' | 'user';
   text: string;
+  pending?: boolean;
+  error?: boolean;
+  /** Inline edit state for previously-sent user messages. */
+  editing?: boolean;
+  editText?: string;
+  /** Workspace git commit captured before this message ran (for revert). */
+  snapshotCommit?: string;
+}
+
+export interface EditSubmitDialog {
+  messageId: number;
+  text: string;
+  canRevert: boolean;
+  isAgent: boolean;
 }
 
 export interface ExplorerClipboard {
@@ -42,12 +75,6 @@ export interface ExplorerClipboard {
   path: string;
   name: string;
   type: 'file' | 'folder';
-}
-
-export interface RecentFileEntry {
-  path: string;
-  name: string;
-  openedAt: number;
 }
 
 export interface ContextMenuState {
@@ -66,6 +93,7 @@ export class ChatHome implements OnInit, OnDestroy {
   @ViewChild('folderInput') folderInput?: ElementRef<HTMLInputElement>;
   @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
   @ViewChild(IdeTerminalComponent) ideTerminal?: IdeTerminalComponent;
+  @ViewChild('proposalPanelEl') proposalPanelEl?: ElementRef<HTMLDivElement>;
 
   activeActivity: ActivityView = 'files';
   bottomTab: BottomPanelTab = 'terminal';
@@ -101,6 +129,50 @@ export class ChatHome implements OnInit, OnDestroy {
 
   chatInput = '';
   nextMsgId = 1;
+  chatSending = false;
+  chatStatus = '';
+  indexing = false;
+  indexChunkCount = 0;
+  ragMode: RagMode = 'auto';
+  private readonly ragModeKey = 'pass-ai-rag-mode';
+  private autoIndexTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * One thread, two capability levels (like Cursor's Ask/Agent):
+   * 'ask' answers with no tools; 'build' gives the agent tools and file proposals.
+   */
+  assistantMode: AssistantMode = 'ask';
+  agentApplying = false;
+  /** Plan / tool steps / findings belong to the build turn — hidden during plain Q&A. */
+  artifactsVisible = true;
+  verifyRunning = false;
+  /** First snapshot commit of the current auto-fix run, for one-click revert. */
+  verifyBaseCommit = '';
+  pendingProposals: FileProposal[] = [];
+  /** User-chosen height of the proposals panel; null = default (CSS max-height). */
+  proposalPanelHeight: number | null = null;
+  private proposalResizeStartY = 0;
+  private proposalResizeStartHeight = 0;
+  agentToolSteps: AgentToolStep[] = [];
+  reviewFindings: ReviewFinding[] = [];
+  testRunSummary = '';
+  specializedAgentMode: SpecializedAgentMode = 'scaffold';
+  readonly specializedAgents = SPECIALIZED_AGENTS;
+  projectPlan: ProjectPlan | null = null;
+  /** Auto-continue rounds for Scaffold until plan files are proposed. */
+  private scaffoldAutoRound = 0;
+  private scaffoldStallCount = 0;
+  private scaffoldLastMissingCount = -1;
+  private readonly maxScaffoldAutoRounds = 10;
+  expandedDiffPath: string | null = null;
+  conversations: ConversationSummary[] = [];
+  activeConversationId: number | null = null;
+  activeConversationTitle = '';
+  editorSelection = '';
+  private cancelChatStream: (() => void) | null = null;
+  private agentRequestSub: Subscription | null = null;
+  editSubmitDialog: EditSubmitDialog | null = null;
+  dontAskEditRevert = false;
+  private readonly editRevertPrefKey = 'pass-ai-edit-revert-pref';
   saving = false;
   loadingTree = false;
   statusMessage = '';
@@ -115,12 +187,14 @@ export class ChatHome implements OnInit, OnDestroy {
 
   contextMenu: ContextMenuState | null = null;
   explorerClipboard: ExplorerClipboard | null = null;
-  recentFiles: RecentFileEntry[] = [];
-  recentFolders: string[] = [];
+  recentProjects: ProjectSummary[] = [];
+  activeProject: ProjectSummary | null = null;
+  private contextNamedProjectId = '';
   showRecentSubmenu = false;
-  private readonly recentFilesKey = 'pass-ai-recent-files';
-  private readonly recentFoldersKey = 'pass-ai-recent-folders';
   private readonly maxRecent = 12;
+  private autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly autosaveDelayMs = 900;
+  private autosaveInFlight: Promise<void> | null = null;
 
   messages: ChatMessage[] = [];
 
@@ -167,6 +241,7 @@ export class ChatHome implements OnInit, OnDestroy {
     private router: Router,
     private route: ActivatedRoute,
     private workspace: WorkspaceApi,
+    private aiApi: AiApi,
     private terminal: TerminalService,
     private workspaceSession: WorkspaceSession,
     private cdr: ChangeDetectorRef,
@@ -179,10 +254,10 @@ export class ChatHome implements OnInit, OnDestroy {
   ngOnInit() {
     this.openTabs = [];
     this.activeTabId = '';
-    this.loadRecentLists();
-    this.refreshTree();
-    this.refreshProblems();
-    this.refreshBinding();
+    this.loadRagMode();
+    void this.bootstrapProjects();
+    // Auto mode: if nothing indexed yet, start in the background
+    setTimeout(() => this.maybeAutoIndex('startup'), 800);
 
     // New window opened with ?import=folder|files&ws=... → open real local folder
     const importMode = this.route.snapshot.queryParamMap.get('import');
@@ -204,6 +279,20 @@ export class ChatHome implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    this.cancelChatStream?.();
+    this.agentRequestSub?.unsubscribe();
+    this.agentRequestSub = null;
+    if (this.autoIndexTimer) {
+      clearTimeout(this.autoIndexTimer);
+      this.autoIndexTimer = null;
+    }
+    if (this.autosaveTimer) {
+      clearTimeout(this.autosaveTimer);
+      this.autosaveTimer = null;
+    }
+    void this.flushAutosave();
+    this.cancelChatStream = null;
+    this.stopProposalResize();
     this.terminal.disconnect();
   }
 
@@ -313,7 +402,7 @@ export class ChatHome implements OnInit, OnDestroy {
     });
   }
 
-  /** Opens native Windows folder dialog and works directly on that real folder. */
+  /** Opens native Windows folder dialog and registers it as an account project. */
   openRealLocalFolder() {
     this.showNewMenu = false;
     this.openMenu = null;
@@ -323,8 +412,8 @@ export class ChatHome implements OnInit, OnDestroy {
     this.statusMessage = this.importProgress;
     this.cdr.detectChanges();
 
-    this.workspace.openLocalFolder().subscribe({
-      next: (res) => this.applyLinkedWorkspace(res),
+    this.workspace.openLocalProject().subscribe({
+      next: (res) => this.applyOpenedProject(res),
       error: (err) => {
         this.syncUiAfterOsDialog(() => {
           this.importing = false;
@@ -353,8 +442,8 @@ export class ChatHome implements OnInit, OnDestroy {
     this.importProgress = 'Linking folder…';
     this.statusMessage = this.importProgress;
     this.cdr.detectChanges();
-    this.workspace.bindLocalFolder(path).subscribe({
-      next: (res) => this.applyLinkedWorkspace(res),
+    this.workspace.linkProject(path).subscribe({
+      next: (res) => this.applyOpenedProject(res),
       error: (err) => {
         this.syncUiAfterOsDialog(() => {
           this.importing = false;
@@ -366,28 +455,141 @@ export class ChatHome implements OnInit, OnDestroy {
     });
   }
 
-  /** Apply linked-folder result and force explorer to repaint (OS dialog steals focus/zone). */
-  private applyLinkedWorkspace(res: BindingResult) {
+  /** Apply opened/created project and force explorer to repaint. */
+  private applyOpenedProject(res: ProjectOpenResult | BindingResult) {
     this.syncUiAfterOsDialog(() => {
       this.importing = false;
       this.importProgress = '';
-      this.boundLocalPath = res.path || '';
-      if (res.path) {
-        this.rememberRecentFolder(res.path);
+      const project = (res as ProjectOpenResult).project;
+      if (project?.projectId) {
+        this.activateProject(project);
       }
+      this.boundLocalPath = res.path || project?.absolutePath || '';
       this.openTabs = [];
       this.activeTabId = '';
-      this.statusMessage = `Editing real folder: ${res.path}`;
-      this.pushOutput(`[workspace] Linked real folder ${res.path}`);
+      this.activeConversationId = null;
+      this.activeConversationTitle = '';
+      this.messages = [];
+      this.pendingProposals = [];
+      this.statusMessage = `Editing project: ${project?.name || res.path}`;
+      this.pushOutput(`[workspace] Opened ${this.boundLocalPath}`);
 
       if (res.tree) {
         this.fileTree = this.applyExpandedState([res.tree], new Set(['']));
         this.loadingTree = false;
       }
-      // Always re-fetch so the explorer updates even if the dialog left Angular's zone
       this.refreshTree(['']);
       this.refreshProblems();
       this.reconnectTerminal();
+      this.refreshConversations();
+      this.refreshRecentProjects();
+      this.maybeAutoIndex('bind');
+    });
+  }
+
+  /** Apply linked-folder result and force explorer to repaint (OS dialog steals focus/zone). */
+  private applyLinkedWorkspace(res: BindingResult) {
+    this.applyOpenedProject(res);
+  }
+
+  private activateProject(project: ProjectSummary) {
+    this.activeProject = project;
+    this.workspaceSession.setActiveProject(project.projectId);
+    this.boundLocalPath = project.absolutePath || this.boundLocalPath;
+  }
+
+  private async bootstrapProjects() {
+    try {
+      const list = await firstValueFrom(this.workspace.listProjects());
+      this.recentProjects = list || [];
+      const currentId = this.workspaceSession.id;
+      const match = this.recentProjects.find((p) => p.projectId === currentId);
+      if (match) {
+        const opened = await firstValueFrom(this.workspace.openProject(match.projectId));
+        this.applyOpenedProject(opened);
+        return;
+      }
+      if (!this.workspaceSession.isFreshWindow && this.recentProjects.length > 0) {
+        const opened = await firstValueFrom(this.workspace.openProject(this.recentProjects[0].projectId));
+        this.applyOpenedProject(opened);
+        return;
+      }
+      // No projects yet — migrate current session / create AppData project
+      const ensured = await firstValueFrom(
+        this.workspace.ensureProject('Untitled Project', this.workspaceSession.id)
+      );
+      this.applyOpenedProject(ensured);
+    } catch (err: any) {
+      this.statusMessage = 'Could not load projects';
+      this.pushOutput(`[projects] ${err?.message || err}`);
+      this.refreshTree();
+      this.refreshProblems();
+      this.refreshBinding();
+      this.refreshAiHealth();
+      this.refreshIndexStatus();
+      this.refreshConversations();
+    } finally {
+      this.refreshAiHealth();
+      this.refreshIndexStatus();
+    }
+  }
+
+  createNewProject() {
+    this.closeMenus();
+    const name = prompt('New project name', 'My Project');
+    if (name === null) {
+      return;
+    }
+    const trimmed = name.trim() || 'Untitled Project';
+    void this.flushAutosave().then(() => {
+      this.importing = true;
+      this.importProgress = 'Creating project…';
+      this.statusMessage = this.importProgress;
+      this.workspace.createProject(trimmed).subscribe({
+        next: (res) => this.applyOpenedProject(res),
+        error: (err) => {
+          this.importing = false;
+          this.importProgress = '';
+          this.statusMessage = 'Create project failed';
+          alert(typeof err?.error === 'string' ? err.error : 'Create project failed');
+        }
+      });
+    });
+  }
+
+  openRecentProject(project: ProjectSummary) {
+    this.closeMenus();
+    if (!project?.projectId) {
+      return;
+    }
+    if (this.activeProject?.projectId === project.projectId) {
+      this.statusMessage = `Already in ${project.name}`;
+      return;
+    }
+    void this.flushAutosave().then(() => {
+      this.importing = true;
+      this.importProgress = `Opening ${project.name}…`;
+      this.workspace.openProject(project.projectId).subscribe({
+        next: (res) => this.applyOpenedProject(res),
+        error: (err) => {
+          this.importing = false;
+          this.importProgress = '';
+          this.statusMessage = 'Could not open project';
+          alert(typeof err?.error === 'string' ? err.error : 'Could not open project');
+        }
+      });
+    });
+  }
+
+  refreshRecentProjects() {
+    this.workspace.listProjects().subscribe({
+      next: (list) => {
+        this.recentProjects = (list || []).slice(0, this.maxRecent);
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.recentProjects = [];
+      }
     });
   }
 
@@ -755,7 +957,6 @@ export class ChatHome implements OnInit, OnDestroy {
     const existing = this.openTabs.find((t) => t.path === path && !t.unsavedNew);
     if (existing) {
       this.activeTabId = existing.id;
-      this.rememberRecentFile(path, name || existing.title);
       return;
     }
 
@@ -770,71 +971,12 @@ export class ChatHome implements OnInit, OnDestroy {
         };
         this.openTabs.push(tab);
         this.activeTabId = tab.id;
-        this.rememberRecentFile(file.path, title);
       },
       error: (err) => {
         this.statusMessage = 'Could not open file';
         this.pushOutput(`Open error: ${err?.error || err?.message || err}`);
       }
     });
-  }
-
-  private loadRecentLists() {
-    try {
-      const files = JSON.parse(localStorage.getItem(this.recentFilesKey) || '[]');
-      this.recentFiles = Array.isArray(files) ? files.slice(0, this.maxRecent) : [];
-    } catch {
-      this.recentFiles = [];
-    }
-    try {
-      const folders = JSON.parse(localStorage.getItem(this.recentFoldersKey) || '[]');
-      this.recentFolders = Array.isArray(folders) ? folders.slice(0, this.maxRecent) : [];
-    } catch {
-      this.recentFolders = [];
-    }
-  }
-
-  private rememberRecentFile(path: string, name?: string) {
-    if (!path) {
-      return;
-    }
-    const entry: RecentFileEntry = {
-      path,
-      name: name || path.split('/').pop() || path,
-      openedAt: Date.now()
-    };
-    this.recentFiles = [entry, ...this.recentFiles.filter((f) => f.path !== path)].slice(0, this.maxRecent);
-    localStorage.setItem(this.recentFilesKey, JSON.stringify(this.recentFiles));
-  }
-
-  private rememberRecentFolder(absolutePath: string) {
-    if (!absolutePath) {
-      return;
-    }
-    this.recentFolders = [absolutePath, ...this.recentFolders.filter((p) => p !== absolutePath)].slice(
-      0,
-      this.maxRecent
-    );
-    localStorage.setItem(this.recentFoldersKey, JSON.stringify(this.recentFolders));
-  }
-
-  openRecentFile(entry: RecentFileEntry) {
-    this.closeMenus();
-    this.openRemoteFile(entry.path, entry.name);
-  }
-
-  openRecentFolder(absolutePath: string) {
-    this.closeMenus();
-    this.bindTypedLocalFolder(absolutePath);
-  }
-
-  clearRecentLists() {
-    this.recentFiles = [];
-    this.recentFolders = [];
-    localStorage.removeItem(this.recentFilesKey);
-    localStorage.removeItem(this.recentFoldersKey);
-    this.statusMessage = 'Recent list cleared';
-    this.closeMenus();
   }
 
   selectTab(id: string) {
@@ -847,11 +989,23 @@ export class ChatHome implements OnInit, OnDestroy {
     if (index < 0) {
       return;
     }
-    this.openTabs.splice(index, 1);
-    if (this.activeTabId === id) {
-      const next = this.openTabs[index] ?? this.openTabs[index - 1];
-      this.activeTabId = next?.id ?? '';
+    const tab = this.openTabs[index];
+    const finishClose = () => {
+      const i = this.openTabs.findIndex((t) => t.id === id);
+      if (i < 0) {
+        return;
+      }
+      this.openTabs.splice(i, 1);
+      if (this.activeTabId === id) {
+        const next = this.openTabs[i] ?? this.openTabs[i - 1];
+        this.activeTabId = next?.id ?? '';
+      }
+    };
+    if (tab?.dirty) {
+      void this.writeTab(tab, false).finally(finishClose);
+      return;
     }
+    finishClose();
   }
 
   createNewFile() {
@@ -875,7 +1029,6 @@ export class ChatHome implements OnInit, OnDestroy {
           };
           this.openTabs.push(tab);
           this.activeTabId = tab.id;
-          this.rememberRecentFile(file.path, tab.title);
           this.statusMessage = `Created ${path}`;
           this.refreshProblems();
         },
@@ -983,6 +1136,10 @@ export class ChatHome implements OnInit, OnDestroy {
     this.createNewFile();
   }
 
+  menuNewProject() {
+    this.createNewProject();
+  }
+
   menuOpenFolder() {
     this.closeMenus();
     this.triggerImportFolder();
@@ -1064,7 +1221,115 @@ export class ChatHome implements OnInit, OnDestroy {
 
   menuSave() {
     this.closeMenus();
-    this.saveActiveFile();
+    this.saveProjectAs();
+  }
+
+  onEditorValueChange(value: string) {
+    const tab = this.activeTab;
+    if (!tab) {
+      return;
+    }
+    tab.content = value;
+    tab.dirty = true;
+    this.scheduleAutosave();
+  }
+
+  saveActiveFile() {
+    const tab = this.activeTab;
+    if (!tab) {
+      return;
+    }
+    void this.writeTab(tab, true);
+  }
+
+  /** Save Project: native folder picker → relocate and continue editing there. */
+  saveProjectAs() {
+    const projectId = this.activeProject?.projectId || this.workspaceSession.id;
+    if (!projectId) {
+      this.statusMessage = 'No active project to save';
+      return;
+    }
+    void this.flushAutosave().then(() => {
+      this.saving = true;
+      this.statusMessage = 'Choose where to save the project…';
+      this.workspace.saveProjectAs(projectId).subscribe({
+        next: (res) => {
+          this.saving = false;
+          this.applyOpenedProject(res);
+          this.statusMessage = `Project saved to ${res.path}`;
+        },
+        error: (err) => {
+          this.saving = false;
+          const msg = typeof err?.error === 'string' ? err.error : 'Save project cancelled or failed';
+          if (String(msg).toLowerCase().includes('cancel')) {
+            this.statusMessage = 'Save cancelled';
+            return;
+          }
+          this.statusMessage = 'Save project failed';
+          alert(msg);
+        }
+      });
+    });
+  }
+
+  private scheduleAutosave() {
+    if (this.autosaveTimer) {
+      clearTimeout(this.autosaveTimer);
+    }
+    this.autosaveTimer = setTimeout(() => {
+      this.autosaveTimer = null;
+      void this.flushAutosave();
+    }, this.autosaveDelayMs);
+  }
+
+  private async flushAutosave(): Promise<void> {
+    if (this.autosaveInFlight) {
+      await this.autosaveInFlight;
+    }
+    const dirty = this.openTabs.filter((t) => t.dirty && t.path);
+    if (!dirty.length) {
+      return;
+    }
+    this.autosaveInFlight = (async () => {
+      for (const tab of dirty) {
+        await this.writeTab(tab, false);
+      }
+    })();
+    try {
+      await this.autosaveInFlight;
+    } finally {
+      this.autosaveInFlight = null;
+    }
+  }
+
+  private async writeTab(tab: EditorTab, showStatus: boolean): Promise<void> {
+    if (!tab.path) {
+      return;
+    }
+    if (showStatus) {
+      this.saving = true;
+    }
+    try {
+      await firstValueFrom(this.workspace.writeFile(tab.path, tab.content));
+      tab.dirty = false;
+      if (showStatus) {
+        this.statusMessage = `Saved ${tab.path}`;
+      }
+      this.pushOutput(`[save] ${tab.path}`);
+      this.refreshProblems();
+      this.scheduleAutoIndex(2500);
+    } catch (err: any) {
+      tab.dirty = true;
+      this.statusMessage = 'Autosave failed';
+      this.pushOutput(`[save] failed ${tab.path}: ${err?.message || err}`);
+      if (showStatus) {
+        alert(typeof err?.error === 'string' ? err.error : 'Save failed');
+      }
+    } finally {
+      if (showStatus) {
+        this.saving = false;
+      }
+    }
   }
 
   private shouldSkipUploadPath(path: string): boolean {
@@ -1196,6 +1461,23 @@ export class ChatHome implements OnInit, OnDestroy {
       this.pushOutput(`[import] Fast ZIP upload: ${result.saved} files`);
       this.refreshProblems();
       this.reconnectTerminal();
+      // Ensure imported content belongs to a durable account project
+      try {
+        const ensured = await firstValueFrom(
+          this.workspace.ensureProject(
+            this.activeProject?.name || 'Imported Project',
+            this.workspaceSession.id
+          )
+        );
+        this.activateProject(ensured.project);
+        this.refreshRecentProjects();
+        this.refreshConversations();
+        if (ensured.tree) {
+          this.fileTree = this.markExpanded([ensured.tree]);
+        }
+      } catch {
+        // keep imported files even if project registration fails
+      }
     } catch (err: unknown) {
       const anyErr = err as { error?: string | { message?: string }; message?: string; status?: number };
       let message = 'Import failed';
@@ -1259,7 +1541,7 @@ export class ChatHome implements OnInit, OnDestroy {
     const key = event.key.toLowerCase();
     if ((event.ctrlKey || event.metaKey) && key === 's') {
       event.preventDefault();
-      this.saveActiveFile();
+      this.saveProjectAs();
       return;
     }
     if ((event.ctrlKey || event.metaKey) && key === 'o') {
@@ -1278,40 +1560,22 @@ export class ChatHome implements OnInit, OnDestroy {
     }
   }
 
-  onEditorValueChange(value: string) {
-    const tab = this.activeTab;
-    if (!tab) {
-      return;
-    }
-    tab.content = value;
-    tab.dirty = true;
-  }
-
   onEditorCursor(pos: { line: number; column: number }) {
     this.cursorLine = pos.line;
     this.cursorCol = pos.column;
   }
 
-  saveActiveFile() {
-    const tab = this.activeTab;
-    if (!tab) {
-      return;
-    }
-    this.saving = true;
-    this.workspace.writeFile(tab.path, tab.content).subscribe({
-      next: () => {
-        tab.dirty = false;
-        this.saving = false;
-        this.statusMessage = `Saved ${tab.path}`;
-        this.pushOutput(`[save] ${tab.path}`);
-        this.refreshProblems();
-      },
-      error: (err) => {
-        this.saving = false;
-        this.statusMessage = 'Save failed';
-        alert(typeof err?.error === 'string' ? err.error : 'Save failed');
-      }
-    });
+  onEditorSelection(text: string) {
+    this.editorSelection = text || '';
+  }
+
+  private buildAiExtras(): { activePath?: string; mentionPaths: string[]; selection?: string; openPaths: string[] } {
+    return {
+      activePath: this.activeTab?.path,
+      mentionPaths: [],
+      selection: this.editorSelection?.trim() ? this.editorSelection : undefined,
+      openPaths: this.openTabs.map((t) => t.path).filter(Boolean)
+    };
   }
 
   deleteActivePath() {
@@ -1520,29 +1784,1791 @@ export class ChatHome implements OnInit, OnDestroy {
   }
 
   resetChat() {
+    this.cancelChatStream?.();
+    this.cancelChatStream = null;
+    this.chatSending = false;
+    this.editSubmitDialog = null;
     this.messages = [];
     this.chatInput = '';
     this.nextMsgId = 1;
+    this.activeConversationId = null;
+    this.activeConversationTitle = '';
+    this.aiTab = 'chat';
+  }
+
+  refreshConversations() {
+    this.aiApi.listConversations(this.workspaceSession.id).subscribe({
+      next: (list) => {
+        this.conversations = list || [];
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.conversations = [];
+      }
+    });
+  }
+
+  openHistoryTab() {
+    this.aiTab = 'history';
+    this.refreshConversations();
+  }
+
+  newConversation() {
+    this.resetChat();
+    this.resetAgentArtifacts();
+    this.activeConversationId = null;
+    this.activeConversationTitle = '';
+    this.aiTab = 'chat';
+    this.statusMessage = 'New conversation';
+  }
+
+  openConversation(id: number) {
+    if (!id || this.chatSending) {
+      return;
+    }
+    this.aiApi.getConversation(id).subscribe({
+      next: (detail) => {
+        this.activeConversationId = detail.id;
+        this.activeConversationTitle = detail.title || 'Conversation';
+        this.assistantMode = detail.mode === 'agent' ? 'build' : 'ask';
+        this.aiTab = 'chat';
+        const mapped: ChatMessage[] = (detail.messages || []).map((m, idx) => ({
+          id: m.id ?? idx + 1,
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          text: m.content || ''
+        }));
+        this.nextMsgId = mapped.reduce((max, m) => Math.max(max, m.id), 0) + 1;
+        this.messages = mapped;
+        this.pendingProposals = [];
+        this.statusMessage =
+          mapped.length === 0
+            ? `Opened “${detail.title}” (no saved messages yet — send to continue)`
+            : `Loaded: ${detail.title}`;
+        this.cdr.detectChanges();
+      },
+      error: (err) => {
+        this.statusMessage = err?.error?.error || err?.message || 'Could not load conversation';
+      }
+    });
+  }
+
+  deleteConversation(id: number, event?: Event) {
+    event?.stopPropagation();
+    if (!id) {
+      return;
+    }
+    this.aiApi.deleteConversation(id).subscribe({
+      next: () => {
+        if (this.activeConversationId === id) {
+          this.newConversation();
+        }
+        this.refreshConversations();
+        this.statusMessage = 'Conversation deleted';
+      },
+      error: (err) => {
+        this.statusMessage = err?.error?.error || 'Delete failed';
+      }
+    });
+  }
+
+  private persistTurn(mode: 'chat' | 'agent', userText: string, assistantText: string) {
+    if (!assistantText?.trim()) {
+      return;
+    }
+    this.aiApi
+      .saveConversationTurn({
+        conversationId: this.activeConversationId,
+        mode,
+        workspaceId: this.workspaceSession.id,
+        userMessage: userText,
+        assistantMessage: assistantText,
+        title: userText.slice(0, 80)
+      })
+      .subscribe({
+        next: (detail) => {
+          this.activeConversationId = detail.id;
+          this.activeConversationTitle = detail.title || this.activeConversationTitle;
+          this.refreshConversations();
+        },
+        error: (err) => {
+          const msg = err?.error?.error || err?.error?.message || err?.message || 'save failed';
+          this.pushOutput(`[ai] could not save conversation: ${msg}`);
+        }
+      });
   }
 
   useQuickAction(prompt: string) {
     this.chatInput = prompt;
-    this.sendChat();
+    this.send();
   }
 
-  sendChat() {
-    const text = this.chatInput.trim();
-    if (!text) {
+  onChatEnter(event: Event) {
+    const ke = event as KeyboardEvent;
+    if (ke.shiftKey) {
       return;
     }
-    this.messages.push({ id: this.nextMsgId++, role: 'user', text });
+    ke.preventDefault();
+    this.send();
+  }
+
+  onEditEnter(event: Event, msg: ChatMessage) {
+    const ke = event as KeyboardEvent;
+    if (ke.shiftKey) {
+      return;
+    }
+    ke.preventDefault();
+    this.submitEditMessage(msg);
+  }
+
+  refreshAiHealth() {
+    this.aiApi.health().subscribe({
+      next: (h) => {
+        this.chatStatus = h.message || (h.ok ? 'AI ready' : 'AI unavailable');
+        this.statusMessage = this.chatStatus;
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.chatStatus = 'Cannot reach AI backend';
+      }
+    });
+  }
+
+  refreshIndexStatus() {
+    this.aiApi.indexStatus().subscribe({
+      next: (s) => {
+        this.indexChunkCount = s.chunks ?? 0;
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.indexChunkCount = 0;
+      }
+    });
+  }
+
+  setRagMode(mode: RagMode) {
+    this.ragMode = mode;
+    try {
+      localStorage.setItem(this.ragModeKey, mode);
+    } catch {
+      /* ignore */
+    }
+    this.statusMessage =
+      mode === 'auto'
+        ? 'RAG Auto: indexes when needed, uses semantic search'
+        : mode === 'on'
+          ? 'RAG On: always use indexed snippets'
+          : 'RAG Off: open file + @mentions only';
+    if (mode === 'auto' || mode === 'on') {
+      this.maybeAutoIndex('mode');
+    }
+    this.cdr.markForCheck();
+  }
+
+  private loadRagMode() {
+    try {
+      const raw = localStorage.getItem(this.ragModeKey);
+      if (raw === 'auto' || raw === 'on' || raw === 'off') {
+        this.ragMode = raw;
+      }
+    } catch {
+      this.ragMode = 'auto';
+    }
+  }
+
+  /** Whether this turn should request RAG from the backend. */
+  private shouldUseRag(): boolean {
+    if (this.ragMode === 'off') {
+      return false;
+    }
+    if (this.ragMode === 'on') {
+      return true;
+    }
+    // auto: use RAG only once something is indexed
+    return this.indexChunkCount > 0;
+  }
+
+  scheduleAutoIndex(delayMs = 1200) {
+    if (this.ragMode === 'off') {
+      return;
+    }
+    if (this.autoIndexTimer) {
+      clearTimeout(this.autoIndexTimer);
+    }
+    this.autoIndexTimer = setTimeout(() => {
+      this.autoIndexTimer = null;
+      this.maybeAutoIndex('schedule');
+    }, delayMs);
+  }
+
+  private maybeAutoIndex(_reason: string) {
+    if (this.ragMode === 'off' || this.indexing) {
+      return;
+    }
+    // Reindex when empty, after folder bind, or when user switches to Auto/On
+    const needIndex =
+      this.indexChunkCount === 0 || _reason === 'bind' || _reason === 'mode';
+    if (!needIndex) {
+      return;
+    }
+    this.indexWorkspaceForRag(true);
+  }
+
+  indexWorkspaceForRag(silent = false) {
+    if (this.indexing) {
+      return;
+    }
+    this.indexing = true;
+    if (!silent) {
+      this.statusMessage = 'Indexing workspace for semantic search…';
+    }
+    this.aiApi.index().subscribe({
+      next: (res) => {
+        this.indexing = false;
+        this.indexChunkCount = res.chunksStored;
+        this.statusMessage = res.message;
+        this.pushOutput(`[ai] ${res.message}`);
+        this.cdr.markForCheck();
+      },
+      error: (err) => {
+        this.indexing = false;
+        const msg = err?.error?.error || err?.message || 'Index failed';
+        this.statusMessage = String(msg);
+        this.pushOutput(`[ai] index error: ${msg}`);
+        this.cdr.markForCheck();
+      }
+    });
+  }
+
+  /**
+   * In Auto/On with an empty index, wait for indexing before sending (best-effort).
+   */
+  private ensureRagBeforeSend(then: () => void) {
+    if (this.ragMode === 'off') {
+      then();
+      return;
+    }
+    if (this.indexChunkCount > 0 || this.indexing) {
+      then();
+      return;
+    }
+    this.indexing = true;
+    this.statusMessage = 'Auto-indexing workspace for RAG…';
+    this.aiApi.index().subscribe({
+      next: (res) => {
+        this.indexing = false;
+        this.indexChunkCount = res.chunksStored ?? 0;
+        this.pushOutput(`[ai] ${res.message || 'indexed'}`);
+        then();
+      },
+      error: () => {
+        this.indexing = false;
+        then();
+      }
+    });
+  }
+
+  /**
+   * Single entry point for the one thread. The Ask/Build toggle decides the capability
+   * level — nothing guesses your intent from keywords.
+   */
+  send() {
+    const text = this.chatInput.trim();
+    if (!text || this.chatSending) {
+      return;
+    }
+    if (this.assistantMode === 'build') {
+      this.sendBuild(text);
+    } else {
+      this.sendAsk(text);
+    }
+  }
+
+  setAssistantMode(mode: AssistantMode) {
+    if (this.assistantMode === mode) {
+      return;
+    }
+    this.assistantMode = mode;
+    this.statusMessage =
+      mode === 'build'
+        ? 'Build mode — the agent can read, edit and propose files'
+        : 'Ask mode — answers only, no file changes';
+  }
+
+  /** Ask: streaming answer, no tools, never touches files. */
+  private sendAsk(text: string) {
+    // A question is not part of the build: tuck the plan/steps away (state is kept,
+    // so "Show plan" brings it back with its phase progress intact).
+    this.artifactsVisible = false;
+    const userMsg: ChatMessage = { id: this.nextMsgId++, role: 'user', text };
+    this.messages.push(userMsg);
+    this.snapshotBeforeMessage(userMsg);
     this.chatInput = '';
-    const fileHint = this.activeTab ? `\nActive file: ${this.activeTab.path}` : '';
+    const assistantId = this.nextMsgId++;
+    this.messages.push({ id: assistantId, role: 'assistant', text: '', pending: true });
+    this.chatSending = true;
+    this.cdr.detectChanges();
+
+    this.ensureRagBeforeSend(() => this.runChatStream(text, assistantId));
+  }
+
+  /** Capture a workspace git snapshot so an edited message can revert file changes. */
+  private snapshotBeforeMessage(msg: ChatMessage) {
+    this.workspace.snapshot(`Before message: ${msg.text.slice(0, 60)}`).subscribe({
+      next: (res) => {
+        if (res?.commit) {
+          msg.snapshotCommit = res.commit;
+        }
+      },
+      error: () => undefined
+    });
+  }
+
+  /** Begin editing a previously-sent user message (chat or agent). */
+  startEditMessage(msg: ChatMessage) {
+    if (msg.role !== 'user' || this.chatSending) {
+      return;
+    }
+    for (const m of this.messages) {
+      m.editing = false;
+    }
+    msg.editing = true;
+    msg.editText = msg.text;
+    this.cdr.detectChanges();
+  }
+
+  cancelEditMessage(msg: ChatMessage) {
+    msg.editing = false;
+    msg.editText = undefined;
+  }
+
+  /** User confirmed the inline edit — decide whether to ask about reverting. */
+  submitEditMessage(msg: ChatMessage) {
+    const next = (msg.editText ?? '').trim();
+    if (!next) {
+      return;
+    }
+    const isAgent = this.messages.includes(msg);
+    const canRevert = !!msg.snapshotCommit;
+    const pref = localStorage.getItem(this.editRevertPrefKey);
+    if (pref === 'revert' || pref === 'keep') {
+      this.resubmitFromMessage(msg.id, next, pref === 'revert' && canRevert, isAgent);
+      return;
+    }
+    this.dontAskEditRevert = false;
+    this.editSubmitDialog = { messageId: msg.id, text: next, canRevert, isAgent };
+    this.cdr.detectChanges();
+  }
+
+  cancelEditDialog() {
+    this.editSubmitDialog = null;
+  }
+
+  confirmEditDialog(revert: boolean) {
+    const dialog = this.editSubmitDialog;
+    if (!dialog) {
+      return;
+    }
+    if (this.dontAskEditRevert) {
+      localStorage.setItem(this.editRevertPrefKey, revert ? 'revert' : 'keep');
+    }
+    this.editSubmitDialog = null;
+    this.resubmitFromMessage(dialog.messageId, dialog.text, revert && dialog.canRevert, dialog.isAgent);
+  }
+
+  /** Rewrite a user message, clear everything after it, optionally revert files, then re-send. */
+  private resubmitFromMessage(messageId: number, newText: string, revert: boolean, isAgent: boolean) {
+    const list = isAgent ? this.messages : this.messages;
+    const idx = list.findIndex((m) => m.id === messageId);
+    if (idx < 0) {
+      return;
+    }
+    const msg = list[idx];
+    const commit = msg.snapshotCommit;
+    msg.text = newText;
+    msg.editing = false;
+    msg.editText = undefined;
+    // Clear all messages after the edited one
+    const trimmed = list.slice(0, idx + 1);
+    if (isAgent) {
+      this.messages = trimmed;
+    } else {
+      this.messages = trimmed;
+    }
+
+    const proceed = () => {
+      const assistantId = this.nextMsgId++;
+      if (isAgent) {
+        this.messages.push({ id: assistantId, role: 'assistant', text: 'Working…', pending: true });
+        this.chatSending = true;
+        this.pendingProposals = [];
+        this.agentToolSteps = [];
+        this.reviewFindings = [];
+        this.testRunSummary = '';
+        this.expandedDiffPath = null;
+        this.cdr.detectChanges();
+        this.ensureRagBeforeSend(() => this.runAgentRequest(newText, assistantId, []));
+      } else {
+        this.messages.push({ id: assistantId, role: 'assistant', text: '', pending: true });
+        this.chatSending = true;
+        this.cdr.detectChanges();
+        this.ensureRagBeforeSend(() => this.runChatStream(newText, assistantId));
+      }
+    };
+
+    if (revert && commit) {
+      this.statusMessage = 'Reverting file changes…';
+      this.workspace.revert(commit).subscribe({
+        next: () => {
+          this.refreshTree();
+          this.refreshProblems();
+          this.pushOutput(`[ai] reverted workspace to ${commit.slice(0, 8)}`);
+          proceed();
+        },
+        error: (err) => {
+          this.statusMessage = 'Revert failed — continuing without revert';
+          this.pushOutput(`[ai] revert failed: ${err?.error?.message || err?.message || err}`);
+          proceed();
+        }
+      });
+    } else {
+      proceed();
+    }
+  }
+
+  private runChatStream(text: string, assistantId: number) {
+    const mentionPaths = this.extractMentionPaths(text);
+    const extras = this.buildAiExtras();
+    const history: ChatHistoryItem[] = this.messages
+      .filter((m) => m.id !== assistantId && !m.error)
+      .slice(0, -1)
+      .map((m) => ({
+        role: m.role,
+        content: m.text
+      }));
+
+    const body = {
+      message: text,
+      history,
+      activePath: extras.activePath,
+      mentionPaths,
+      selection: extras.selection,
+      openPaths: extras.openPaths,
+      useRag: this.shouldUseRag()
+    };
+
+    this.cancelChatStream?.();
+    this.cancelChatStream = this.aiApi.chatStream(
+      body,
+      (token) => {
+        this.ngZone.run(() => {
+          const msg = this.messages.find((m) => m.id === assistantId);
+          if (msg) {
+            msg.text += token;
+            msg.pending = true;
+            this.cdr.detectChanges();
+          }
+        });
+      },
+      (done) => {
+        this.ngZone.run(() => {
+          const msg = this.messages.find((m) => m.id === assistantId);
+          if (msg) {
+            msg.text = done.reply || msg.text;
+            msg.pending = false;
+          }
+          this.chatSending = false;
+          this.cancelChatStream = null;
+          const ctx = [...(done.usedPaths || []), ...(done.ragPaths || [])];
+          if (ctx.length) {
+            this.pushOutput(`[ai] context: ${ctx.join(', ')}`);
+          } else if (this.ragMode !== 'off') {
+            this.pushOutput(`[ai] RAG mode=${this.ragMode} · ${this.indexChunkCount} chunks`);
+          }
+          const assistantText = msg?.text || done.reply || '';
+          if (!msg?.error && assistantText) {
+            this.persistTurn('chat', text, assistantText);
+          }
+          this.cdr.detectChanges();
+        });
+      },
+      (error) => {
+        this.ngZone.run(() => {
+          const msg = this.messages.find((m) => m.id === assistantId);
+          if (msg) {
+            msg.text = msg.text || `Error: ${error}`;
+            msg.pending = false;
+            msg.error = true;
+          }
+          this.chatSending = false;
+          this.cancelChatStream = null;
+          this.chatStatus = error;
+          this.statusMessage = error;
+          this.pushOutput(`[ai] ${error}`);
+          this.cdr.detectChanges();
+        });
+      }
+    );
+  }
+
+  private extractMentionPaths(text: string): string[] {
+    const paths = new Set<string>();
+    const re = /@([\w./\\-]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      paths.add(m[1].replace(/\\/g, '/'));
+    }
+    return [...paths];
+  }
+
+
+
+  /**
+   * Answer "did it work / how do I open it" from the real terminal output.
+   * Never re-runs the command.
+   */
+  handleProjectStatus(userText: string) {
+    this.chatInput = '';
+    this.aiTab = 'chat';
+    this.messages.push({ id: this.nextMsgId++, role: 'user', text: userText });
+
+    const log = this.ideTerminal?.recentOutput() || '';
+    const lastCmd = this.ideTerminal?.lastCommand || '';
+    const answer = this.explainRunOutcome(log, lastCmd);
+
+    this.messages.push({ id: this.nextMsgId++, role: 'assistant', text: answer.text });
+    this.statusMessage = answer.status;
+    this.cdr.detectChanges();
+
+    if (answer.openUrl) {
+      try {
+        window.open(answer.openUrl, '_blank');
+      } catch {
+        /* popup blocked */
+      }
+    }
+  }
+
+  /** Read the terminal tail and say plainly what happened. */
+  private explainRunOutcome(
+    log: string,
+    lastCmd: string
+  ): { text: string; status: string; openUrl?: string } {
+    if (!log.trim()) {
+      return {
+        text:
+          'Nothing has run in the TERMINAL yet, so there is no result to report.\n\n' +
+          'Say **run** and I will start the project, then ask me again and I will read the output.',
+        status: 'Nothing has run yet'
+      };
+    }
+
+    const portInUse = /port (\d+) was already in use/i.exec(log);
+    const failedToStart = /APPLICATION FAILED TO START/i.test(log);
+    if (failedToStart && portInUse) {
+      const port = portInUse[1];
+      return {
+        text:
+          `**No — the app did not start.** Port **${port}** is already taken by another process, ` +
+          `so Spring Boot shut down right after building.\n\n` +
+          `The build itself was fine (\`BUILD SUCCESS\`) — only the web server failed.\n\n` +
+          `Two ways forward:\n` +
+          `1. **Use a free port** — add \`server.port=8090\` to ` +
+          `\`backend/src/main/resources/application.properties\`, then say **run**.\n` +
+          `2. **Free port ${port}** — in TERMINAL run ` +
+          `\`netstat -ano | findstr :${port}\` then \`taskkill /PID <pid> /F\`, then say **run**.\n\n` +
+          `Tell me which one you prefer and I will do it.`,
+        status: `Port ${port} already in use`
+      };
+    }
+
+    if (failedToStart) {
+      const desc = /Description:\s*\n+\s*([^\n]+)/i.exec(log);
+      return {
+        text:
+          `**The app did not start.**${desc ? ` Reason: ${desc[1].trim()}` : ''}\n\n` +
+          `Paste the red error block here and I will propose the file fixes.`,
+        status: 'Application failed to start'
+      };
+    }
+
+    if (/BUILD FAILURE/i.test(log) || /COMPILATION ERROR/i.test(log)) {
+      return {
+        text:
+          '**The build failed** — nothing is running yet.\n\n' +
+          'Paste the `[ERROR]` lines here (or say **fix**) and I will propose corrected files to Apply.',
+        status: 'Build failed'
+      };
+    }
+
+    const tomcat = /Tomcat started on port[^\d]*(\d+)/i.exec(log);
+    const started = /Started \w+Application in/i.test(log);
+    if (tomcat && started) {
+      const url = `http://localhost:${tomcat[1]}`;
+      return {
+        text:
+          `**Yes — it is running.** Spring Boot started on port **${tomcat[1]}**.\n\n` +
+          `Open ${url} (I just opened it for you).\n\n` +
+          `A bare \`/\` may show a 404 — that is normal until a controller maps it. ` +
+          `Your endpoints are the paths in your \`@GetMapping\` / \`@RequestMapping\` annotations.\n\n` +
+          `Keep the TERMINAL tab open; closing it stops the server.`,
+        status: `Running on port ${tomcat[1]}`,
+        openUrl: url
+      };
+    }
+
+    const pyServer = /Serving HTTP on .* port (\d+)/i.exec(log);
+    if (pyServer) {
+      const url = `http://127.0.0.1:${pyServer[1]}/`;
+      return {
+        text:
+          `**Yes — the static site is being served** on port **${pyServer[1]}**.\n\n` +
+          `Open ${url} (opened for you). Stop it with Ctrl+C in TERMINAL.`,
+        status: `Static site on ${pyServer[1]}`,
+        openUrl: url
+      };
+    }
+
+    const viteLocal = /(?:Local|On Your Network):\s*(https?:\/\/[^\s]+)/i.exec(log);
+    if (viteLocal) {
+      return {
+        text: `**Yes — the dev server is up.** Open ${viteLocal[1]} (opened for you).`,
+        status: 'Dev server running',
+        openUrl: viteLocal[1]
+      };
+    }
+
+    if (/Downloading from central|Downloaded from central/i.test(log) && !started) {
+      return {
+        text:
+          '**Still working** — Maven is downloading dependencies. That is the first-run cost.\n\n' +
+          'Wait for `Started ...Application in X seconds`, then ask me again and I will give you the URL.',
+        status: 'Maven downloading dependencies'
+      };
+    }
+
+    const tail = log.trim().split('\n').slice(-12).join('\n');
+    return {
+      text:
+        `I could not find a clear success or failure marker in the terminal.\n\n` +
+        (lastCmd ? `Last command: \`${lastCmd}\`\n\n` : '') +
+        `Last lines:\n\`\`\`\n${tail}\n\`\`\`\n\n` +
+        `If that looks like an error, say **fix** and I will propose file changes.`,
+      status: 'Run outcome unclear'
+    };
+  }
+
+  /**
+   * Cursor-style close-the-loop: snapshot → build → if it fails, ask the Code agent
+   * to fix, auto-apply, snapshot, rebuild — up to a cap. A git snapshot before each
+   * pass means every automatic edit can be undone with one click.
+   */
+  async runVerifyLoop(userText: string) {
+    if (this.verifyRunning || this.chatSending) {
+      return;
+    }
+    this.verifyRunning = true;
+    this.aiTab = 'chat';
+    this.chatInput = '';
+    this.chatInput = '';
+    this.specializedAgentMode = 'code';
+    this.messages.push({ id: this.nextMsgId++, role: 'user', text: userText });
+    const statusId = this.nextMsgId++;
+    this.messages.push({
+      id: statusId,
+      role: 'assistant',
+      text: 'Starting build-and-fix loop…',
+      pending: true
+    });
+    this.cdr.detectChanges();
+
+    const say = (text: string, pending = false) => {
+      this.messages.push({ id: this.nextMsgId++, role: 'assistant', text, pending });
+      this.cdr.detectChanges();
+    };
+    const setStatus = (text: string) => {
+      const m = this.messages.find((x) => x.id === statusId);
+      if (m) {
+        m.text = text;
+      }
+      this.statusMessage = text;
+      this.cdr.detectChanges();
+    };
+
+    const maxAttempts = 3;
+    try {
+      setStatus('Saving a snapshot so changes can be undone…');
+      const snap = await firstValueFrom(this.workspace.snapshot('auto-fix: baseline'));
+      this.verifyBaseCommit = snap?.commit || '';
+      if (snap && snap.gitAvailable === false) {
+        say('Note: git is not installed, so automatic undo is off for this run. I will still build and fix.');
+      }
+
+      for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+        setStatus(attempt === 0 ? 'Building…' : `Rebuilding (attempt ${attempt}/${maxAttempts})…`);
+        let build: BuildResult;
+        try {
+          build = await firstValueFrom(this.workspace.build());
+        } catch (e: unknown) {
+          say(`Could not run the build: ${this.errText(e)}`);
+          break;
+        }
+        this.pushOutput(`[verify] ${build.command} → exit ${build.exitCode}`);
+
+        if (build.ok) {
+          setStatus('Build passed');
+          say(
+            `**Build passed** (\`${build.command}\`).\n\n` +
+              `Now say **run** to start it, then ask me "did it work?" for the URL.`
+          );
+          break;
+        }
+
+        if (attempt === maxAttempts) {
+          setStatus('Still failing after auto-fixes');
+          say(
+            `**Still failing after ${maxAttempts} auto-fix attempts.** Last errors:\n\n` +
+              '```\n' + this.tailText(build.tail, 1600) + '\n```\n\n' +
+              (this.verifyBaseCommit
+                ? 'You can undo all of these automatic edits with the **Undo auto-fix** button.'
+                : 'Review the changes and adjust manually.')
+          );
+          break;
+        }
+
+        say(
+          `Attempt ${attempt + 1}: build failed — reading the error and proposing a fix…\n\n` +
+            '```\n' + this.tailText(build.tail, 1200) + '\n```',
+          true
+        );
+
+        const hintPaths = this.collectWorkspaceFilePaths(this.fileTree)
+          .filter((p) => /pom\.xml$|package\.json$|\.java$|\.ts$|\.tsx$|\.js$|\.html$/i.test(p))
+          .slice(0, 16)
+          .map((p) => `- ${p}`)
+          .join('\n');
+
+        const fixPrompt =
+          `[FIX ERROR] The build failed. Fix it with a SURGICAL change. ` +
+          `read_file the failing file, then edit_file with the exact old_string→new_string. ` +
+          `Emit ONLY \`\`\`pass-tool fences. Do NOT scaffold or rewrite whole files from memory. ` +
+          `Spring Boot 3: jakarta.persistence (not javax). Java class name MUST match filename.\n\n` +
+          `Known files:\n${hintPaths || '(use search)'}\n\n` +
+          `BUILD OUTPUT (${build.command}):\n\`\`\`\n${this.tailText(build.tail, 4000)}\n\`\`\`\n\n` +
+          `Then done with a one-line summary.`;
+
+        let res;
+        try {
+          res = await firstValueFrom(
+            this.aiApi.specializedAgent('code', { message: fixPrompt, useRag: this.shouldUseRag() })
+          );
+        } catch (e: unknown) {
+          say(`The fix agent failed: ${this.errText(e)}`);
+          break;
+        }
+
+        const files = res?.files || [];
+        if (!files.length) {
+          say(
+            'The agent did not propose any file changes, so I stopped.\n\n' +
+              (res?.reply ? `It said:\n\n${this.tailText(res.reply, 800)}` : '') +
+              '\n\nPaste the error here and I will try a targeted fix.'
+          );
+          break;
+        }
+
+        setStatus(`Applying ${files.length} fix(es)…`);
+        try {
+          const applied = await firstValueFrom(this.aiApi.applyFiles(files));
+          say(
+            `Applied ${applied.applied.length} file(s): ${applied.applied.join(', ')}` +
+              (applied.errors.length ? `\nErrors: ${applied.errors.join('; ')}` : '')
+          );
+        } catch (e: unknown) {
+          say(`Could not apply the proposed fix: ${this.errText(e)}`);
+          break;
+        }
+
+        await firstValueFrom(this.workspace.snapshot(`auto-fix: attempt ${attempt + 1}`));
+        this.refreshTree();
+      }
+    } catch (e: unknown) {
+      say(`Auto-fix loop error: ${this.errText(e)}`);
+    } finally {
+      const m = this.messages.find((x) => x.id === statusId);
+      if (m) {
+        m.pending = false;
+      }
+      this.verifyRunning = false;
+      this.cdr.detectChanges();
+    }
+  }
+
+  /** Undo every edit the auto-fix loop made, back to its baseline snapshot. */
+  revertAutoFix() {
+    if (this.verifyRunning) {
+      return;
+    }
+    this.workspace.revert(this.verifyBaseCommit || undefined).subscribe({
+      next: (res) => {
+        this.messages.push({
+          id: this.nextMsgId++,
+          role: 'assistant',
+          text: res.ok ? 'Reverted all auto-fix edits to the baseline snapshot.' : `Revert failed: ${res.message || ''}`
+        });
+        this.statusMessage = res.ok ? 'Reverted auto-fix edits' : 'Revert failed';
+        this.verifyBaseCommit = '';
+        this.refreshTree();
+        this.cdr.detectChanges();
+      },
+      error: (err) => {
+        this.statusMessage = 'Revert failed';
+        this.pushOutput(`[verify] revert error: ${err?.error?.error || err?.message || err}`);
+      }
+    });
+  }
+
+  get canRevertAutoFix(): boolean {
+    return !!this.verifyBaseCommit && !this.verifyRunning;
+  }
+
+  private tailText(text: string, max: number): string {
+    const t = text || '';
+    return t.length > max ? '…' + t.slice(-max) : t;
+  }
+
+  private errText(e: unknown): string {
+    const err = e as { error?: { error?: string }; message?: string };
+    return err?.error?.error || err?.message || String(e);
+  }
+
+  /** Detect project type and start it in the IDE terminal (no file rewrite). */
+  handleRunProject(userText: string) {
+    this.chatInput = '';
+    const paths = this.collectWorkspaceFilePaths(this.fileTree);
+    const hasIndex = paths.some((p) => /(^|\/)index\.html$/i.test(p));
+    const pomPath = paths.find((p) => /(^|\/)pom\.xml$/i.test(p));
+    const hasPom = !!pomPath;
+    const hasPkg = paths.some((p) => /(^|\/)package\.json$/i.test(p));
+    const hasMvnW = paths.some((p) => /(^|\/)mvnw(\.cmd)?$/i.test(p));
+
+    this.showBottomPanel = true;
+    this.bottomTab = 'terminal';
+    this.aiTab = 'chat';
+
+    this.messages.push({ id: this.nextMsgId++, role: 'user', text: userText });
+
+    if (hasIndex && !hasPom) {
+      // Stop any previous static server first. Orphaned `http.server` processes keep the
+      // project folder locked (their working dir is inside it), which blocks folder renames.
+      const cmd =
+        "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*http.server 5500*' } | " +
+        'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; ' +
+        'py -m http.server 5500';
+      this.finishRunKickoff(
+        cmd,
+        'Static site: open http://127.0.0.1:5500/ in your browser (server runs in TERMINAL).',
+        true
+      );
+      return;
+    }
+
+    if (hasPom) {
+      const pomDir = pomPath!.includes('/') ? pomPath!.replace(/\/pom\.xml$/i, '') : '';
+      const startSpring = (useWrapper: boolean) => {
+        const runCmd = useWrapper ? '.\\mvnw.cmd spring-boot:run' : 'mvn spring-boot:run';
+        const javaHome = `$env:JAVA_HOME='C:\\Program Files\\Java\\jdk-17'`;
+        const cmd = pomDir
+          ? `${javaHome}; cd ${pomDir}; ${runCmd}`
+          : `${javaHome}; ${runCmd}`;
+        this.finishRunKickoff(
+          cmd,
+          (useWrapper
+            ? 'Spring Boot via Maven Wrapper (no global mvn needed). First run may download Maven — wait.'
+            : 'Spring Boot with system Maven.') +
+            '\nWatch for "Started …Application" — then ask me "did it work?" and I will read the terminal and give you the exact URL.',
+          false
+        );
+      };
+
+      if (hasMvnW) {
+        startSpring(true);
+        return;
+      }
+
+      this.messages.push({
+        id: this.nextMsgId++,
+        role: 'assistant',
+        text: 'Maven is not on PATH. Seeding **Maven Wrapper** (`mvnw.cmd`) into the project, then starting…'
+      });
+      this.statusMessage = 'Seeding Maven Wrapper…';
+      this.cdr.detectChanges();
+      this.workspace.ensureMavenWrapper(pomDir).subscribe({
+        next: (res) => {
+          if (!res.ok) {
+            this.messages.push({
+              id: this.nextMsgId++,
+              role: 'assistant',
+              text:
+                `Could not add Maven Wrapper: ${res.error || 'unknown'}.\n` +
+                `Install Maven or copy mvnw.cmd into the project, then say **run**.`
+            });
+            this.statusMessage = 'Maven wrapper failed';
+            this.cdr.detectChanges();
+            return;
+          }
+          this.refreshTree(pomDir ? [pomDir] : ['']);
+          startSpring(true);
+        },
+        error: (err) => {
+          this.messages.push({
+            id: this.nextMsgId++,
+            role: 'assistant',
+            text:
+              `Could not seed Maven Wrapper (${err?.error?.error || err?.message || 'error'}).\n` +
+              `Install Maven and add it to PATH, then say **run**.`
+          });
+          this.statusMessage = 'Maven wrapper failed';
+          this.cdr.detectChanges();
+        }
+      });
+      return;
+    }
+
+    if (hasPkg) {
+      this.finishRunKickoff('npm start', 'Node: running npm start — check the terminal for the local URL.', false);
+      return;
+    }
+
     this.messages.push({
       id: this.nextMsgId++,
       role: 'assistant',
-      text: `Noted.${fileHint}\n\nAI model wiring is next — workspace/terminal/debug are already live on the Java backend.`
+      text:
+        'No runnable project detected (need index.html, pom.xml, or package.json). ' +
+        'Create a project first with COMPOSER, Apply all, then say “run”.'
     });
+    this.statusMessage = 'Nothing to run yet';
+    this.cdr.detectChanges();
+  }
+
+  private finishRunKickoff(cmd: string, tip: string, openStatic: boolean) {
+    this.messages.push({
+      id: this.nextMsgId++,
+      role: 'assistant',
+      text:
+        `Running without regenerating files.\n\n$ ${cmd}\n\n${tip}\n` +
+        `(Started in the TERMINAL panel — leave it open.)`
+    });
+    this.statusMessage = `Running: ${cmd}`;
+    this.pushOutput(`[run] ${cmd}`);
+    this.cdr.detectChanges();
+
+    const kickOff = async () => {
+      this.showBottomPanel = true;
+      this.bottomTab = 'terminal';
+      this.cdr.detectChanges();
+      await new Promise((r) => setTimeout(r, 150));
+
+      let term = this.ideTerminal;
+      if (!term) {
+        await new Promise((r) => setTimeout(r, 300));
+        term = this.ideTerminal;
+      }
+      if (!term) {
+        this.statusMessage = 'Terminal panel unavailable — paste in TERMINAL: ' + cmd;
+        this.messages.push({
+          id: this.nextMsgId++,
+          role: 'assistant',
+          text: `Could not reach the terminal panel. Paste this in TERMINAL:\n\n${cmd}`
+        });
+        this.cdr.detectChanges();
+        return;
+      }
+
+      term.connect();
+      const ok = await term.runCommand(cmd);
+      if (ok) {
+        this.statusMessage = `Running in TERMINAL: ${cmd}`;
+        if (openStatic) {
+          setTimeout(() => {
+            try {
+              window.open('http://127.0.0.1:5500/', '_blank');
+            } catch {
+              /* popup blocked */
+            }
+          }, 1500);
+        }
+      } else {
+        this.statusMessage = 'Terminal not connected — paste: ' + cmd;
+        this.messages.push({
+          id: this.nextMsgId++,
+          role: 'assistant',
+          text:
+            `Terminal still not connected after retry. Click TERMINAL → + (reconnect), then paste:\n\n${cmd}`
+        });
+      }
+      this.cdr.detectChanges();
+    };
+    void kickOff();
+  }
+
+  get hasScaffoldMissing(): boolean {
+    return this.scaffoldMissingPaths().length > 0;
+  }
+
+  private collectWorkspaceFilePaths(nodes: WorkspaceNode[]): string[] {
+    const out: string[] = [];
+    const walk = (list: WorkspaceNode[]) => {
+      for (const n of list || []) {
+        if (n.type === 'file' && n.path) {
+          out.push(n.path.replace(/\\/g, '/'));
+        }
+        if (n.children?.length) {
+          walk(n.children);
+        }
+      }
+    };
+    walk(nodes);
+    // also include open tabs (in case tree not refreshed)
+    for (const t of this.openTabs) {
+      if (t.path) {
+        out.push(t.path.replace(/\\/g, '/'));
+      }
+    }
+    return out;
+  }
+
+  /** Build: the agent runs tools and queues file proposals for review. */
+  private sendBuild(text: string) {
+    if (!text || this.chatSending) {
+      return;
+    }
+    this.maybeRenameProjectFromContext(text);
+    const isContinue =
+      text.startsWith('Continue the scaffold') ||
+      text.startsWith('Begin phase') ||
+      text.startsWith('[FIX ERROR]');
+    if (!isContinue && this.specializedAgentMode === 'scaffold') {
+      this.scaffoldAutoRound = 0;
+      this.scaffoldStallCount = 0;
+      this.scaffoldLastMissingCount = -1;
+    }
+    // Only a scaffold continuation inherits the previous plan and proposals —
+    // a brand-new request starts from a clean slate.
+    const keepProposals = isContinue && this.specializedAgentMode === 'scaffold' && this.pendingProposals.length > 0;
+    const previousProposals = keepProposals ? [...this.pendingProposals] : [];
+    const agentUserMsg: ChatMessage = { id: this.nextMsgId++, role: 'user', text };
+    this.messages.push(agentUserMsg);
+    this.snapshotBeforeMessage(agentUserMsg);
+    this.chatInput = '';
+    const assistantId = this.nextMsgId++;
+    this.messages.push({
+      id: assistantId,
+      role: 'assistant',
+      text: isContinue ? 'Auto-continuing scaffold…' : 'Working…',
+      pending: true
+    });
+    this.chatSending = true;
+    if (!keepProposals) {
+      this.pendingProposals = [];
+    }
+    this.agentToolSteps = [];
+    this.reviewFindings = [];
+    this.testRunSummary = '';
+    this.expandedDiffPath = null;
+    // Keep the plan across turns — a fresh scaffold response overwrites it in
+    // mergeProjectPlan, so we never destroy it just because the user typed something.
+    this.artifactsVisible = true;
+    this.cdr.detectChanges();
+
+    this.ensureRagBeforeSend(() => this.runAgentRequest(text, assistantId, previousProposals));
+  }
+
+  continueScaffold() {
+    if (!this.projectPlan?.files?.length || this.chatSending) {
+      return;
+    }
+    const stillMissing = this.scaffoldMissingPaths();
+    if (!stillMissing.length) {
+      if (this.canContinueNextPhase) {
+        this.continueNextPhase();
+        return;
+      }
+      this.statusMessage = 'All planned files are proposed — Apply all';
+      this.scaffoldAutoRound = 0;
+      return;
+    }
+    this.sendBuild(
+      `Continue the scaffold. write_file the remaining planned files only:\n` +
+        stillMissing.map((p) => `- ${p}`).join('\n') +
+        `\nThen call done. Do not re-submit the full plan.`
+    );
+  }
+
+  get canContinueNextPhase(): boolean {
+    const plan = this.projectPlan;
+    if (!plan?.phases?.length) {
+      return false;
+    }
+    const idx = plan.currentPhase ?? 0;
+    if (idx + 1 >= plan.phases.length) {
+      return false;
+    }
+    const files = plan.files || [];
+    if (!files.length) {
+      return false;
+    }
+    // Only advance after the active phase was Applied to disk
+    return files.every((f) => f.status === 'applied');
+  }
+
+  continueNextPhase() {
+    if (!this.canContinueNextPhase || this.chatSending || !this.projectPlan?.phases) {
+      return;
+    }
+    const next = (this.projectPlan.currentPhase ?? 0) + 1;
+    const phase = this.projectPlan.phases[next];
+    if (!phase) {
+      return;
+    }
+    const files = (phase.files?.length ? phase.files : []).map((f) => f.path);
+    this.projectPlan.currentPhase = next;
+    if (phase.files?.length) {
+      this.projectPlan.files = phase.files.map((f) => ({ ...f, status: f.status === 'applied' ? 'applied' : 'pending' }));
+    }
+    this.scaffoldAutoRound = 0;
+    this.scaffoldStallCount = 0;
+    this.scaffoldLastMissingCount = -1;
+    this.sendBuild(
+      `Begin phase ${next + 1}: ${phase.name || 'Next'}.\n` +
+        `Call submit_plan for THIS phase only (currentPhase: ${next}) with these files, then write_file each:\n` +
+        (files.length
+          ? files.map((p) => `- ${p}`).join('\n')
+          : '- (choose 6–10 focused files for this phase)') +
+        `\nDo NOT rewrite earlier phases. Do not dump Markdown.`
+    );
+  }
+
+  private scaffoldMissingPaths(): string[] {
+    if (!this.projectPlan?.files?.length) {
+      return [];
+    }
+    const proposed = new Set((this.pendingProposals || []).map((p) => p.path.replace(/\\/g, '/')));
+    return this.projectPlan.files
+      .map((f) => (f.path || '').replace(/\\/g, '/'))
+      .filter((p) => {
+        if (!p || proposed.has(p)) {
+          return false;
+        }
+        const meta = this.projectPlan!.files!.find((f) => (f.path || '').replace(/\\/g, '/') === p);
+        return meta?.status !== 'applied' && meta?.status !== 'proposed';
+      });
+  }
+
+  /** After each scaffold response, keep going until the plan is fully proposed. */
+  private maybeAutoContinueScaffold() {
+    if (this.specializedAgentMode !== 'scaffold' || this.chatSending) {
+      return;
+    }
+    const missing = this.scaffoldMissingPaths();
+    if (!missing.length) {
+      this.scaffoldAutoRound = 0;
+      this.scaffoldStallCount = 0;
+      this.scaffoldLastMissingCount = -1;
+      if (this.pendingProposals.length) {
+        const phaseName = this.projectPlan?.phases?.[(this.projectPlan.currentPhase ?? 0)]?.name;
+        this.statusMessage = phaseName
+          ? `Phase "${phaseName}" ready — Apply all` + (this.canContinueNextPhase ? ', then Next phase' : '')
+          : `Scaffold complete: ${this.pendingProposals.length} file(s) ready — Apply all`;
+      }
+      return;
+    }
+    if (this.scaffoldAutoRound >= this.maxScaffoldAutoRounds) {
+      this.statusMessage = `Auto-continue stopped after ${this.maxScaffoldAutoRounds} rounds (${missing.length} still missing). Click Continue missing.`;
+      return;
+    }
+    if (this.scaffoldLastMissingCount === missing.length) {
+      this.scaffoldStallCount++;
+      if (this.scaffoldStallCount >= 2) {
+        this.statusMessage = `Auto-continue stalled (${missing.length} still missing). Click Continue missing.`;
+        return;
+      }
+    } else {
+      this.scaffoldStallCount = 0;
+    }
+    this.scaffoldLastMissingCount = missing.length;
+    this.scaffoldAutoRound++;
+    this.statusMessage = `Auto-continuing… ${missing.length} file(s) left (round ${this.scaffoldAutoRound}/${this.maxScaffoldAutoRounds})`;
+    this.cdr.detectChanges();
+    setTimeout(() => {
+      if (!this.chatSending && this.specializedAgentMode === 'scaffold') {
+        this.continueScaffold();
+      }
+    }, 400);
+  }
+
+  setSpecializedAgentMode(mode: SpecializedAgentMode) {
+    this.specializedAgentMode = mode;
+    this.assistantMode = 'build';
+    this.aiTab = 'chat';
+    const meta = this.specializedAgents.find((a) => a.id === mode);
+    this.statusMessage = meta ? `${meta.label} Agent — ${meta.hint}` : mode;
+  }
+
+  private runAgentRequest(text: string, assistantId: number, previousProposals: FileProposal[] = []) {
+    const token = this.auth.getValidToken() ?? this.auth.getToken();
+    if (!token) {
+      const msg = this.messages.find((m) => m.id === assistantId);
+      if (msg) {
+        msg.text = 'Not logged in — open Login, sign in, then try again. Your workspace files are safe.';
+        msg.pending = false;
+        msg.error = true;
+      }
+      this.chatSending = false;
+      this.statusMessage = 'Please log in';
+      this.cdr.detectChanges();
+      return;
+    }
+
+    const mentionPaths = this.extractMentionPaths(text);
+    const extras = this.buildAiExtras();
+    const history: ChatHistoryItem[] = this.messages
+      .filter((m) => m.id !== assistantId && !m.error)
+      .slice(0, -1)
+      .map((m) => ({ role: m.role, content: m.text }));
+
+    const body = {
+      message: text,
+      history,
+      activePath: extras.activePath,
+      mentionPaths,
+      selection: extras.selection,
+      openPaths: extras.openPaths,
+      useRag: this.shouldUseRag()
+    };
+
+    this.agentRequestSub?.unsubscribe();
+    this.agentRequestSub = this.aiApi.specializedAgent(this.specializedAgentMode, body).subscribe({
+      next: (res) => {
+        this.agentRequestSub = null;
+        const msg = this.messages.find((m) => m.id === assistantId);
+        if (msg) {
+          msg.text = res.reply || '(no explanation)';
+          msg.pending = false;
+        }
+        const incoming = res.files || [];
+        if (previousProposals.length && this.specializedAgentMode === 'scaffold') {
+          const byPath = new Map<string, FileProposal>();
+          for (const p of previousProposals) {
+            byPath.set(p.path.replace(/\\/g, '/'), p);
+          }
+          for (const p of incoming) {
+            byPath.set(p.path.replace(/\\/g, '/'), p);
+          }
+          this.pendingProposals = [...byPath.values()];
+        } else {
+          this.pendingProposals = incoming;
+        }
+        this.agentToolSteps = res.steps || [];
+        this.reviewFindings = res.findings || [];
+        this.testRunSummary = res.testRunSummary || '';
+        if (res.projectPlan?.files?.length || res.projectPlan?.phases?.length) {
+          this.mergeProjectPlan(res.projectPlan);
+        }
+        this.syncPlanStatusesFromProposals();
+        this.chatSending = false;
+        if (this.pendingProposals.length) {
+          this.expandedDiffPath = this.pendingProposals[0].path;
+          this.statusMessage = `${this.pendingProposals.length} file change(s) ready — review diffs & Apply`;
+          if (this.aiPanelWidth < 480) {
+            this.aiPanelWidth = this.clampAiWidth(520);
+          }
+        } else if (this.reviewFindings.length) {
+          this.statusMessage = `Review: ${this.reviewFindings.length} finding(s)`;
+        } else if (this.projectPlan?.files?.length) {
+          this.statusMessage = `Plan: ${this.projectPlan.title || 'project'} (${this.projectPlan.files.length} files)`;
+        }
+        const assistantText = msg?.text || res.reply || '';
+        if (assistantText) {
+          this.persistTurn('agent', text, assistantText);
+        }
+        this.cdr.detectChanges();
+        if (this.specializedAgentMode === 'scaffold') {
+          this.maybeAutoContinueScaffold();
+        }
+      },
+      error: (err) => {
+        this.agentRequestSub = null;
+        const msg = this.messages.find((m) => m.id === assistantId);
+        let errorText = err?.error?.error || err?.message || 'Agent failed';
+        if (err?.status === 401) {
+          errorText =
+            'Unauthorized (401). Click Sign in again (top/menu), then retry. Do not worry — project files stay on disk.';
+        }
+        if (msg) {
+          msg.text = String(errorText);
+          msg.pending = false;
+          msg.error = true;
+        }
+        this.chatSending = false;
+        this.scaffoldAutoRound = 0;
+        this.statusMessage = String(errorText);
+        this.pushOutput(`[agent] ${errorText}`);
+        this.cdr.detectChanges();
+      }
+    });
+  }
+
+  /** Stop an in-progress chat stream (shown while the assistant is thinking). */
+  /** Stop whatever the single thread is doing — a stream in Ask, or a tool run in Build. */
+  stopAssistant() {
+    if (this.assistantMode === 'build') {
+      this.stopAgent();
+    } else {
+      this.stopChat();
+    }
+  }
+
+  stopChat() {
+    this.cancelChatStream?.();
+    this.cancelChatStream = null;
+    const pending = this.messages.find((m) => m.pending);
+    if (pending) {
+      pending.pending = false;
+      if (!pending.text.trim()) {
+        pending.text = 'Stopped.';
+      }
+    }
+    this.chatSending = false;
+    this.statusMessage = 'Stopped';
+    this.cdr.detectChanges();
+  }
+
+  /** Stop an in-progress agent run (shown while the agent is working). */
+  stopAgent() {
+    this.agentRequestSub?.unsubscribe();
+    this.agentRequestSub = null;
+    const pending = this.messages.find((m) => m.pending);
+    if (pending) {
+      pending.pending = false;
+      if (!pending.text.trim() || pending.text === 'Working…' || pending.text === 'Auto-continuing scaffold…') {
+        pending.text = 'Stopped.';
+      }
+    }
+    this.chatSending = false;
+    this.scaffoldAutoRound = 0;
+    this.statusMessage = 'Stopped';
+    this.cdr.detectChanges();
+  }
+
+  discardProposals() {
+    this.pendingProposals = [];
+    this.agentToolSteps = [];
+    this.expandedDiffPath = null;
+    this.statusMessage = 'Discarded proposed files';
+  }
+
+  private syncPlanStatusesFromProposals() {
+    if (!this.projectPlan?.files?.length) {
+      return;
+    }
+    const proposed = new Set((this.pendingProposals || []).map((p) => p.path.replace(/\\/g, '/')));
+    for (const f of this.projectPlan.files) {
+      const path = (f.path || '').replace(/\\/g, '/');
+      if (f.status === 'applied') {
+        continue;
+      }
+      f.status = proposed.has(path) ? 'proposed' : f.status === 'proposed' ? 'pending' : f.status || 'pending';
+    }
+    const idx = this.projectPlan.currentPhase ?? 0;
+    const phase = this.projectPlan.phases?.[idx];
+    if (phase?.files) {
+      for (const f of phase.files) {
+        const path = (f.path || '').replace(/\\/g, '/');
+        if (f.status === 'applied') {
+          continue;
+        }
+        f.status = proposed.has(path) ? 'proposed' : f.status || 'pending';
+      }
+      const allProposed = phase.files.every(
+        (f) => f.status === 'proposed' || f.status === 'applied' || proposed.has((f.path || '').replace(/\\/g, '/'))
+      );
+      if (allProposed) {
+        phase.status = 'proposed';
+      } else {
+        phase.status = 'active';
+      }
+    }
+  }
+
+  private mergeProjectPlan(incoming: ProjectPlan) {
+    if (!incoming) {
+      return;
+    }
+    if (incoming.phases?.length) {
+      // Prefer server multi-phase plan; keep applied statuses from local when paths match
+      const prev = this.projectPlan;
+      this.projectPlan = {
+        ...incoming,
+        currentPhase: incoming.currentPhase ?? prev?.currentPhase ?? 0
+      };
+      if (prev?.phases?.length) {
+        for (const ph of this.projectPlan.phases || []) {
+          const old = prev.phases.find((p) => p.name === ph.name || p.id === ph.id);
+          if (!old?.files) {
+            continue;
+          }
+          for (const f of ph.files || []) {
+            const match = old.files.find((x) => (x.path || '').replace(/\\/g, '/') === (f.path || '').replace(/\\/g, '/'));
+            if (match?.status === 'applied') {
+              f.status = 'applied';
+            }
+          }
+        }
+      }
+      const cur = this.projectPlan.phases?.[this.projectPlan.currentPhase ?? 0];
+      if (cur?.files?.length) {
+        this.projectPlan.files = cur.files;
+      }
+      this.maybeRenameFromPlan();
+      return;
+    }
+    if (incoming.files?.length) {
+      if (this.projectPlan?.phases?.length) {
+        const idx = this.projectPlan.currentPhase ?? 0;
+        const phase = this.projectPlan.phases[idx];
+        if (phase) {
+          phase.files = incoming.files;
+          phase.status = 'active';
+        }
+        this.projectPlan.files = incoming.files;
+        this.projectPlan.title = incoming.title || this.projectPlan.title;
+        this.projectPlan.stack = incoming.stack || this.projectPlan.stack;
+        this.projectPlan.summary = incoming.summary || this.projectPlan.summary;
+      } else {
+        this.projectPlan = incoming;
+      }
+      this.maybeRenameFromPlan();
+    }
+  }
+
+  applyOneProposal(file: FileProposal) {
+    this.applyProposals([file]);
+  }
+
+  applyAllProposals() {
+    if (!this.pendingProposals.length) {
+      return;
+    }
+    this.applyProposals([...this.pendingProposals]);
+  }
+
+  /**
+   * Re-read applied files that are already open. Without this the tab keeps the pre-Apply
+   * text, so the change looks like it never happened — and a later autosave of that stale
+   * buffer would overwrite what was just applied.
+   */
+  private reloadAppliedTabs(appliedPaths: string[]) {
+    for (const path of appliedPaths) {
+      const tab = this.openTabs.find((t) => t.path === path && !t.unsavedNew);
+      if (!tab) {
+        continue;
+      }
+      this.workspace.readFile(path).subscribe({
+        next: (file) => {
+          tab.content = file.content;
+          tab.dirty = false;
+          this.cdr.detectChanges();
+        },
+        error: () => undefined
+      });
+    }
+  }
+
+  /** Drag the splitter above the proposals panel to grow/shrink it. */
+  startProposalResize(event: MouseEvent) {
+    const panel = this.proposalPanelEl?.nativeElement;
+    if (!panel) {
+      return;
+    }
+    event.preventDefault();
+    this.proposalResizeStartY = event.clientY;
+    this.proposalResizeStartHeight = panel.getBoundingClientRect().height;
+    document.addEventListener('mousemove', this.onProposalResizeMove);
+    document.addEventListener('mouseup', this.onProposalResizeEnd);
+    // Inline, because component styles are encapsulated and cannot target <body>.
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'ns-resize';
+  }
+
+  /** Double-click the splitter to go back to the automatic height. */
+  resetProposalHeight() {
+    this.proposalPanelHeight = null;
+  }
+
+  private readonly onProposalResizeMove = (event: MouseEvent) => {
+    const panel = this.proposalPanelEl?.nativeElement;
+    if (!panel) {
+      return;
+    }
+    // Dragging up must make the panel taller, hence start - current.
+    const delta = this.proposalResizeStartY - event.clientY;
+    const pane = panel.parentElement;
+    const paneHeight = pane ? pane.getBoundingClientRect().height : 0;
+    const max = paneHeight > 0 ? paneHeight * 0.85 : this.proposalResizeStartHeight + delta;
+    const next = Math.min(max, Math.max(120, this.proposalResizeStartHeight + delta));
+    this.proposalPanelHeight = Math.round(next);
+    this.cdr.detectChanges();
+  };
+
+  private readonly onProposalResizeEnd = () => {
+    this.stopProposalResize();
+  };
+
+  private stopProposalResize() {
+    document.removeEventListener('mousemove', this.onProposalResizeMove);
+    document.removeEventListener('mouseup', this.onProposalResizeEnd);
+    document.body.style.userSelect = '';
+    document.body.style.cursor = '';
+  }
+
+  /** Flip the tool-step log from "queued" to "applied" so the panel matches what's on disk. */
+  private markToolStepsApplied(appliedPaths: string[]) {
+    if (!this.agentToolSteps.length || !appliedPaths.length) {
+      return;
+    }
+    const done = new Set(appliedPaths.map((p) => p.replace(/\\/g, '/')));
+    for (const step of this.agentToolSteps) {
+      if (step.name !== 'write_file' && step.name !== 'edit_file') {
+        continue;
+      }
+      if (step.status !== 'queued') {
+        continue;
+      }
+      const path = (step.resultPreview || '').replace(/\\/g, '/');
+      if (done.has(path)) {
+        step.status = 'applied';
+      }
+    }
+  }
+
+  private applyProposals(files: FileProposal[]) {
+    if (!files.length || this.agentApplying) {
+      return;
+    }
+    void this.flushAutosave().then(() => {
+    this.agentApplying = true;
+    this.statusMessage = `Applying ${files.length} file(s)…`;
+    this.aiApi.applyFiles(files).subscribe({
+      next: (res) => {
+        this.agentApplying = false;
+        const applied = res.applied || [];
+        const errors = res.errors || [];
+        this.pendingProposals = this.pendingProposals.filter((p) => !applied.includes(p.path));
+        const expand = applied.map((p) => {
+          const i = p.lastIndexOf('/');
+          return i > 0 ? p.slice(0, i) : '';
+        });
+        this.refreshTree([...new Set(expand)]);
+        if (applied.length) {
+          const first = applied[0];
+          const name = first.split('/').pop() || first;
+          this.reloadAppliedTabs(applied);
+          this.openRemoteFile(first, name);
+          this.statusMessage = `Applied ${applied.length} file(s)`;
+          this.pushOutput(`[agent] applied: ${applied.join(', ')}`);
+          this.markToolStepsApplied(applied);
+          this.messages.push({
+            id: this.nextMsgId++,
+            role: 'assistant',
+            text: `Applied ${applied.length} file(s):\n${applied.map((p) => '• ' + p).join('\n')}`
+          });
+          this.maybeRenameFromPlan();
+          if (this.projectPlan?.files?.length) {
+            const appliedSet = new Set(applied.map((p) => p.replace(/\\/g, '/')));
+            for (const f of this.projectPlan.files) {
+              if (appliedSet.has((f.path || '').replace(/\\/g, '/'))) {
+                f.status = 'applied';
+              }
+            }
+            const idx = this.projectPlan.currentPhase ?? 0;
+            const phase = this.projectPlan.phases?.[idx];
+            if (phase?.files) {
+              for (const f of phase.files) {
+                if (appliedSet.has((f.path || '').replace(/\\/g, '/'))) {
+                  f.status = 'applied';
+                }
+              }
+              const allApplied = phase.files.every((f) => f.status === 'applied');
+              if (allApplied) {
+                phase.status = 'applied';
+                if (this.canContinueNextPhase) {
+                  this.statusMessage = `Phase "${phase.name || idx + 1}" applied — click Next phase`;
+                }
+              }
+            }
+          }
+        }
+        if (errors.length) {
+          this.statusMessage = `Apply errors: ${errors.join('; ')}`;
+          this.pushOutput(`[agent] apply errors: ${errors.join('; ')}`);
+        }
+        this.cdr.detectChanges();
+      },
+      error: (err) => {
+        this.agentApplying = false;
+        const msg = err?.error?.error || err?.message || 'Apply failed';
+        this.statusMessage = String(msg);
+        this.pushOutput(`[agent] ${msg}`);
+        this.cdr.detectChanges();
+      }
+    });
+    });
+  }
+
+  private maybeRenameFromPlan() {
+    const title = this.projectPlan?.title?.trim();
+    const projectId = this.activeProject?.projectId;
+    if (!title || !projectId) {
+      return;
+    }
+    const current = this.activeProject?.name || '';
+    if (
+      current &&
+      !/^untitled/i.test(current) &&
+      current !== 'Workspace' &&
+      this.contextNamedProjectId !== projectId
+    ) {
+      return;
+    }
+    this.workspace.renameProject(projectId, title).subscribe({
+      next: (updated) => {
+        this.activeProject = updated;
+        this.contextNamedProjectId = '';
+        this.refreshRecentProjects();
+        // The folder on disk was renamed too, so the tree label needs a reload.
+        this.refreshTree(['']);
+      },
+      error: () => undefined
+    });
+  }
+
+  private maybeRenameProjectFromContext(prompt: string) {
+    const projectId = this.activeProject?.projectId;
+    const current = this.activeProject?.name || '';
+    if (!projectId || (current && !/^untitled/i.test(current) && current !== 'Workspace')) {
+      return;
+    }
+
+    const title = this.projectNameFromPrompt(prompt);
+    if (!title) {
+      return;
+    }
+
+    this.contextNamedProjectId = projectId;
+    this.workspace.renameProject(projectId, title).subscribe({
+      next: (updated) => {
+        this.activeProject = updated;
+        this.refreshRecentProjects();
+        this.refreshTree(['']);
+        this.statusMessage = `Project named “${updated.name}”`;
+      },
+      error: () => {
+        this.contextNamedProjectId = '';
+      }
+    });
+  }
+
+  private projectNameFromPrompt(prompt: string): string {
+    let value = prompt
+      .replace(/\r?\n/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const purpose = value.match(/\b(?:for|pour)\s+(.+?)(?=\s+(?:with|using|avec|en utilisant|that|qui)\b|[.!?]|$)/i);
+    if (purpose?.[1]) {
+      value = purpose[1];
+    } else {
+      value = value
+        .replace(/^(?:please\s+|s'il vous plaît\s+)?(?:i want you to\s+|je veux que tu\s+|can you\s+|peux-tu\s+)?/i, '')
+        .replace(/^(?:create|build|make|develop|generate|crée|créer|fais|développe)\s+/i, '')
+        .replace(/^(?:me\s+)?(?:a|an|the|un|une|le|la)\s+/i, '')
+        .replace(/^(?:new\s+|nouveau\s+|nouvelle\s+)?(?:project|app|application|website|site|projet)\s*/i, '');
+    }
+
+    value = value
+      .replace(/\b(?:project|projet)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(' ')
+      .slice(0, 6)
+      .join(' ');
+
+    if (value.length < 3) {
+      return '';
+    }
+    return value
+      .slice(0, 60)
+      .replace(/(^|\s)\p{L}/gu, (letter) => letter.toUpperCase());
+  }
+
+  previewProposal(content: string): string {
+    if (!content) {
+      return '(empty)';
+    }
+    return content.length > 400 ? content.slice(0, 400) + '\n…' : content;
+  }
+
+  toggleDiff(path: string) {
+    this.expandedDiffPath = this.expandedDiffPath === path ? null : path;
+  }
+
+  /** Simple line-oriented unified diff for Diff Apply review. */
+  proposalDiff(file: FileProposal): string {
+    return this.proposalDiffLines(file)
+      .map((l) => l.text)
+      .join('\n');
+  }
+
+  proposalDiffLines(file: FileProposal): { kind: 'add' | 'del' | 'ctx'; text: string }[] {
+    const before = (file.previousContent ?? '').replace(/\r\n/g, '\n');
+    const after = (file.content ?? '').replace(/\r\n/g, '\n');
+    const lines: { kind: 'add' | 'del' | 'ctx'; text: string }[] = [];
+    if (!before) {
+      for (const l of after.split('\n')) {
+        lines.push({ kind: 'add', text: '+' + l });
+      }
+      return lines.length > 2500 ? lines.slice(0, 2500).concat([{ kind: 'ctx', text: '…' }]) : lines;
+    }
+    const a = before.split('\n');
+    const b = after.split('\n');
+    const max = Math.max(a.length, b.length);
+    for (let i = 0; i < max; i++) {
+      const left = a[i];
+      const right = b[i];
+      if (left === right) {
+        if (left !== undefined) {
+          lines.push({ kind: 'ctx', text: ' ' + left });
+        }
+      } else {
+        if (left !== undefined) {
+          lines.push({ kind: 'del', text: '-' + left });
+        }
+        if (right !== undefined) {
+          lines.push({ kind: 'add', text: '+' + right });
+        }
+      }
+    }
+    return lines.length > 2500 ? lines.slice(0, 2500).concat([{ kind: 'ctx', text: '…' }]) : lines;
+  }
+
+  /** Clear the agent-side artifacts (proposals, plan, steps) without touching the thread. */
+  resetAgentArtifacts() {
+    this.pendingProposals = [];
+    this.agentToolSteps = [];
+    this.reviewFindings = [];
+    this.testRunSummary = '';
+    this.projectPlan = null;
+    this.expandedDiffPath = null;
   }
 
   logout() {
@@ -1555,3 +3581,5 @@ export class ChatHome implements OnInit, OnDestroy {
     this.outputLines = [...this.outputLines.slice(-200), line];
   }
 }
+
+
