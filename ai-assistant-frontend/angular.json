@@ -2,7 +2,8 @@
   "$schema": "./node_modules/@angular/cli/lib/config/schema.json",
   "version": 1,
   "cli": {
-    "packageManager": "npm"
+    "packageManager": "npm",
+    "analytics": "f917e63f-c9f9-44c7-8106-d4927e6b9c03"
   },
   "newProjectRoot": "projects",
   "projects": {
@@ -22,9 +23,15 @@
               {
                 "glob": "**/*",
                 "input": "public"
+              },
+              {
+                "glob": "**/*",
+                "input": "node_modules/monaco-editor/min/vs",
+                "output": "assets/monaco/vs"
               }
             ],
             "styles": [
+              "node_modules/@xterm/xterm/css/xterm.css",
               "src/styles.css"
             ]
           },
@@ -54,6 +61,9 @@
         },
         "serve": {
           "builder": "@angular/build:dev-server",
+          "options": {
+            "proxyConfig": "proxy.conf.json"
+          },
           "configurations": {
             "production": {
               "buildTarget": "ai-assistant-frontend:build:production"

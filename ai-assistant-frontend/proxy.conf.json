@@ -1,0 +1,17 @@
+{
+  "/api": {
+    "target": "http://localhost:8081",
+    "secure": false,
+    "changeOrigin": true,
+    "logLevel": "debug",
+    "timeout": 3600000,
+    "proxyTimeout": 3600000
+  },
+  "/ws": {
+    "target": "ws://localhost:8081",
+    "secure": false,
+    "ws": true,
+    "changeOrigin": true,
+    "logLevel": "debug"
+  }
+}

@@ -162,9 +162,14 @@ input:focus {
 	transition: transform 140ms ease, box-shadow 160ms ease;
 }
 
-.btn-primary:hover {
+.btn-primary:hover:not(:disabled) {
 	transform: translateY(-1px);
 	box-shadow: 0 8px 18px rgba(97, 98, 255, 0.35);
+}
+
+.btn-primary:disabled {
+	opacity: 0.65;
+	cursor: wait;
 }
 
 .error-text {

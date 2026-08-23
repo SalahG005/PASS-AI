@@ -1,0 +1,5 @@
+/* Root host styles */
+:host {
+  display: block;
+  min-height: 100%;
+}

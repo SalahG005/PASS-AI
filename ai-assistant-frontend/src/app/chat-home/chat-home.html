@@ -1,4 +1,1219 @@
-<section class="panel">
-  <h1>Chat coming soon</h1>
-  <p>Your secure development copilots and project context tools will live here.</p>
-</section>
+<input
+  #folderInput
+  type="file"
+  hidden
+  multiple
+  webkitdirectory
+  directory
+  (change)="onFolderPicked($event)"
+/>
+<input
+  #fileInput
+  type="file"
+  hidden
+  multiple
+  (change)="onFilesPicked($event)"
+/>
+
+<div class="ide" (click)="closeMenus()">
+  <div class="menubar" (click)="$event.stopPropagation()">
+    <div class="menu-item" [class.open]="openMenu === 'file'">
+      <button type="button" class="menu-trigger" (click)="toggleMenu('file', $event)">File</button>
+      @if (openMenu === 'file') {
+        <div class="menu-dropdown">
+          <button type="button" (click)="menuNewFile()"><span>New File</span><kbd>Ctrl+N</kbd></button>
+          <button type="button" (click)="menuNewProject()"><span>New Project</span></button>
+          <button type="button" (click)="menuCreateProject()"><span>Create Project…</span></button>
+          <button type="button" (click)="menuOpenFolder()"><span>Open Folder</span><kbd>Ctrl+O</kbd></button>
+          <div class="menu-flyout-wrap">
+            <button
+              type="button"
+              class="menu-flyout-trigger"
+              (click)="toggleRecentSubmenu($event)"
+              (mouseenter)="showRecentSubmenu = true"
+            >
+              <span>Open Recent</span><span class="chev-right">›</span>
+            </button>
+            @if (showRecentSubmenu) {
+              <div class="menu-flyout" (click)="$event.stopPropagation()">
+                @if (!recentProjects.length) {
+                  <div class="menu-empty">No recent projects</div>
+                }
+                @for (project of recentProjects; track project.projectId) {
+                  <button
+                    type="button"
+                    class="recent-item"
+                    [title]="project.absolutePath"
+                    (click)="openRecentProject(project)"
+                  >
+                    <span class="recent-name">{{ project.name }}</span>
+                    <span class="recent-path">{{ project.absolutePath }}</span>
+                  </button>
+                }
+              </div>
+            }
+          </div>
+          <div class="menu-sep"></div>
+          <button type="button" (click)="menuNewTerminal()"><span>New Terminal</span><kbd>Ctrl+`</kbd></button>
+          <button type="button" (click)="triggerImportFiles(); closeMenus()"><span>Import Files</span></button>
+          <div class="menu-sep"></div>
+          <button type="button" (click)="menuNewWindow()"><span>New Window</span><kbd>Ctrl+Shift+N</kbd></button>
+          <div class="menu-sep"></div>
+          <button type="button" (click)="menuSave()"><span>Save Project</span><kbd>Ctrl+S</kbd></button>
+          <button type="button" (click)="logout()"><span>Exit</span></button>
+        </div>
+      }
+    </div>
+
+    <div class="menu-item" [class.open]="openMenu === 'edit'">
+      <button type="button" class="menu-trigger" (click)="toggleMenu('edit', $event)">Edit</button>
+      @if (openMenu === 'edit') {
+        <div class="menu-dropdown">
+          <button type="button" (click)="menuSave()"><span>Save Project</span><kbd>Ctrl+S</kbd></button>
+          <button type="button" (click)="closeMenus(); deleteActivePath()"><span>Delete File</span></button>
+        </div>
+      }
+    </div>
+
+    <div class="menu-item" [class.open]="openMenu === 'view'">
+      <button type="button" class="menu-trigger" (click)="toggleMenu('view', $event)">View</button>
+      @if (openMenu === 'view') {
+        <div class="menu-dropdown">
+          <button type="button" (click)="menuToggleSidebar()"><span>Toggle Explorer</span></button>
+          <button type="button" (click)="menuToggleTerminal()"><span>Toggle Terminal</span></button>
+          <button type="button" (click)="menuToggleAi()"><span>Toggle AI Panel</span></button>
+        </div>
+      }
+    </div>
+
+    <div class="menu-item" [class.open]="openMenu === 'help'">
+      <button type="button" class="menu-trigger" (click)="toggleMenu('help', $event)">Help</button>
+      @if (openMenu === 'help') {
+        <div class="menu-dropdown">
+          <button type="button" (click)="closeMenus(); statusMessage = 'PASS AI Developer Assistant'"><span>About PASS AI</span></button>
+        </div>
+      }
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <img class="brand-logo" src="pass-logo.png" alt="PASS Consulting Group" width="36" height="36" />
+        <span class="brand-name">PASS AI Developer Assistant</span>
+      </div>
+    </div>
+
+    <div class="topbar-center">
+      <label class="search-box">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true">
+          <circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M16.5 16.5L20 20" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <input
+          type="search"
+          placeholder="Search in project (Ctrl + K)"
+          [(ngModel)]="searchQuery"
+          (keydown.enter)="setActivity('search'); runSearch()"
+          (click)="$event.stopPropagation()"
+        />
+      </label>
+    </div>
+
+    <div class="topbar-right">
+      <button class="ghost-top" type="button" (click)="saveProjectAs(); $event.stopPropagation()" [disabled]="saving" title="Save Project (Ctrl+S)">
+        {{ saving ? 'Saving…' : (activeTab?.dirty ? 'Save Project •' : 'Save Project') }}
+      </button>
+      <button
+        class="icon-btn"
+        type="button"
+        (click)="theme.toggle(); $event.stopPropagation()"
+        [title]="theme.theme() === 'light' ? 'Switch to dark mode' : 'Switch to light mode'"
+        [attr.aria-label]="theme.theme() === 'light' ? 'Switch to dark mode' : 'Switch to light mode'"
+      >
+        @if (theme.theme() === 'light') {
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
+            <path d="M21 14.5A8.5 8.5 0 0 1 9.5 3 7 7 0 1 0 21 14.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+          </svg>
+        } @else {
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.2 5.2l1.6 1.6M17.2 17.2l1.6 1.6M17.2 5.2l1.6-1.6M5.2 18.8l1.6-1.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        }
+      </button>
+      <button class="icon-btn" title="Toggle AI panel" type="button" (click)="showAiPanel = !showAiPanel; $event.stopPropagation()">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+          <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M15 4v16" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+      </button>
+      <button class="invite-btn" type="button" (click)="triggerImportFolder(); $event.stopPropagation()">Import</button>
+      <button class="icon-btn" title="Sign out" type="button" (click)="logout()">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+          <path d="M10 7V5a2 2 0 0 1 2-2h7v18h-7a2 2 0 0 1-2-2v-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M15 12H3m0 0 3-3m-3 3 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="ide-main">
+  <div class="ide-body">
+    <nav class="activity-bar" aria-label="Activity">
+      <div class="activity-top">
+        <button class="activity-btn" [class.active]="activeActivity === 'files' && showSidebar" title="Explorer" type="button" (click)="setActivity('files')">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6H10l2 2h6.5A1.5 1.5 0 0 1 20 9.5v7A1.5 1.5 0 0 1 18.5 18h-13A1.5 1.5 0 0 1 4 16.5v-9Z" stroke="currentColor" stroke-width="1.5"/></svg>
+        </button>
+        <button class="activity-btn" [class.active]="activeActivity === 'search' && showSidebar" title="Search" type="button" (click)="setActivity('search')">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.5"/><path d="M16.5 16.5L21 21" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+        <button class="activity-btn" [class.active]="activeActivity === 'git' && showSidebar" title="Source Control" type="button" (click)="setActivity('git')">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none"><circle cx="6" cy="6" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="6" cy="18" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="18" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M6 8v8M8 18h6a4 4 0 0 0 4-4" stroke="currentColor" stroke-width="1.5"/></svg>
+        </button>
+        <button class="activity-btn" [class.active]="activeActivity === 'debug' && showSidebar" title="Run and Debug" type="button" (click)="setActivity('debug')">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none"><path d="M9 8.5 5 12l4 3.5M15 8.5 19 12l-4 3.5M13.2 5l-2.4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="activity-btn" [class.active]="activeActivity === 'extensions' && showSidebar" title="Extensions" type="button" (click)="setActivity('extensions')">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none"><path d="M8 4h3v3H8V4Zm5 0h3v3h-3V4ZM8 9h3v3H8V9Zm5 0h3v3h-3V9ZM4 14h7v6H4v-6Zm9 0h7v6h-7v-6Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="new-wrap" (click)="$event.stopPropagation()">
+          <button class="activity-btn" title="New / Import" type="button" (click)="showNewMenu = !showNewMenu">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
+          @if (showNewMenu) {
+            <div class="new-menu">
+              <button type="button" (click)="openCreateSkeletonModal()">Create Project…</button>
+              <button type="button" (click)="createNewProject()">New Empty Project</button>
+              <button type="button" (click)="createNewFile()">New File</button>
+              <button type="button" (click)="triggerImportFolder()">Import Folder…</button>
+              <button type="button" (click)="triggerImportFiles()">Import Files…</button>
+            </div>
+          }
+        </div>
+      </div>
+      <div class="activity-bottom">
+        <button class="activity-btn" title="Account / Sign out" type="button" (click)="logout()">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none"><circle cx="12" cy="9" r="3.5" stroke="currentColor" stroke-width="1.5"/><path d="M5 20c1.6-3.2 4-4.8 7-4.8s5.4 1.6 7 4.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+        <button class="activity-btn" title="Refresh workspace" type="button" (click)="refreshTree(); refreshProblems()">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </nav>
+
+    @if (showSidebar) {
+      <aside
+        class="side-panel"
+        [class.resizing]="activeResize === 'side'"
+        [style.width.px]="sidePanelWidth"
+      >
+        <div
+          class="panel-sash panel-sash-e"
+          title="Drag to resize"
+          (mousedown)="startPanelResize('side', $event)"
+          (dblclick)="resetSidePanelWidth()"
+        ></div>
+        @if (activeActivity === 'files') {
+          <div class="panel-header">
+            <span>{{ activeProject?.name || (boundLocalPath ? 'EXPLORER' : 'WORKSPACE') }}</span>
+            <div class="panel-actions">
+              <button type="button" title="Open real local folder" (click)="openRealLocalFolder()">📂</button>
+              <button type="button" title="New File" (click)="createNewFile()">+</button>
+              <button type="button" title="Refresh" (click)="refreshTree()">↻</button>
+            </div>
+          </div>
+          @if (boundLocalPath) {
+            <div class="bound-path" [title]="boundLocalPath">🔗 {{ boundLocalPath }}</div>
+          }
+          <div class="tree" (contextmenu)="$event.preventDefault()">
+            @if (loadingTree) {
+              <p class="muted" style="padding: 12px">Loading workspace…</p>
+            }
+            @for (root of fileTree; track root.path + root.name) {
+              <ng-container *ngTemplateOutlet="treeNode; context: { $implicit: root, depth: 0 }"></ng-container>
+            }
+          </div>
+
+          <ng-template #treeNode let-node let-depth="depth">
+            <div
+              class="tree-row"
+              [class.cut]="explorerClipboard?.mode === 'cut' && explorerClipboard?.path === node.path"
+              [style.paddingLeft.px]="10 + depth * 14"
+              (click)="toggleNode(node); $event.stopPropagation()"
+              (contextmenu)="openExplorerContextMenu($event, node)"
+            >
+              <span class="chev">{{ node.type === 'folder' ? (node.expanded ? '▾' : '▸') : '' }}</span>
+              <span
+                class="file-icon"
+                [attr.data-kind]="fileIcon(node.name, node.type, !!node.expanded).kind"
+                [style.color]="fileIcon(node.name, node.type, !!node.expanded).color"
+              >{{ fileIcon(node.name, node.type, !!node.expanded).label }}</span>
+              <span class="node-name" [class.file]="node.type === 'file'">{{ node.name }}</span>
+            </div>
+            @if (node.type === 'folder' && node.expanded && node.children?.length) {
+              @for (child of node.children; track child.path) {
+                <ng-container *ngTemplateOutlet="treeNode; context: { $implicit: child, depth: depth + 1 }"></ng-container>
+              }
+            }
+          </ng-template>
+          <div class="side-footer">
+            <details open>
+              <summary>OUTLINE</summary>
+              <p class="muted">{{ activeTab ? activeTab.path : 'No file selected.' }}</p>
+            </details>
+            <details>
+              <summary>TIMELINE</summary>
+              <p class="muted">{{ statusMessage || 'No recent activity.' }}</p>
+            </details>
+          </div>
+        }
+
+        @if (activeActivity === 'search') {
+          <div class="panel-header"><span>SEARCH</span></div>
+          <div class="panel-body">
+            <input class="side-input" placeholder="Search" [(ngModel)]="searchQuery" (keydown.enter)="runSearch()" />
+            <button class="ghost-btn" type="button" (click)="runSearch()">{{ searching ? 'Searching…' : 'Search' }}</button>
+            @for (hit of searchHits; track hit.path + hit.line) {
+              <button type="button" class="search-hit" (click)="openRemoteFile(hit.path)">
+                <strong>{{ hit.path }}:{{ hit.line }}</strong>
+                <span>{{ hit.preview }}</span>
+              </button>
+            }
+            @if (!searching && searchQuery && searchHits.length === 0) {
+              <p class="muted">No results.</p>
+            }
+          </div>
+        }
+
+        @if (activeActivity === 'git') {
+          <div class="panel-header"><span>SOURCE CONTROL</span></div>
+          <div class="panel-body">
+            <p class="muted">Run Git from the real terminal below.</p>
+            <button class="ghost-btn" type="button" (click)="debugCommand = 'git status'; runDebug()">git status</button>
+            <p class="hint">Branch context uses the Java workspace shell.</p>
+          </div>
+        }
+
+        @if (activeActivity === 'debug') {
+          <div class="panel-header"><span>RUN AND DEBUG</span></div>
+          <div class="panel-body">
+            <input class="side-input" [(ngModel)]="debugCommand" placeholder="Command e.g. java -version" />
+            <button class="ghost-btn" type="button" (click)="runDebug()">Run Command</button>
+            <button class="ghost-btn" type="button" (click)="debugCommand = 'javac -version'; runDebug()">javac -version</button>
+            <button class="ghost-btn" type="button" (click)="refreshProblems(); bottomTab = 'problems'; showBottomPanel = true">Analyze Problems</button>
+          </div>
+        }
+
+        @if (activeActivity === 'extensions') {
+          <div class="panel-header"><span>EXTENSIONS</span></div>
+          <div class="panel-body">
+            <p class="muted">Marketplace coming later. Core Java workspace tools are active.</p>
+          </div>
+        }
+      </aside>
+    }
+
+    <section class="workspace">
+      <div class="editor-area" [class.with-bottom]="showBottomPanel">
+        <div class="tabs-bar">
+          @for (tab of openTabs; track tab.id) {
+            <button type="button" class="tab" [class.active]="tab.id === activeTabId" (click)="selectTab(tab.id)">
+              <span
+                class="file-icon tab-icon"
+                [attr.data-kind]="fileIcon(tab.title, 'file').kind"
+                [style.color]="fileIcon(tab.title, 'file').color"
+              >{{ fileIcon(tab.title, 'file').label }}</span>
+              <span>{{ tab.title }}{{ tab.dirty ? ' •' : '' }}</span>
+              <span class="tab-close" (click)="closeTab($event, tab.id)">×</span>
+            </button>
+          }
+          @if (openTabs.length === 0) {
+            <span class="empty-tabs">No file open — import a folder or create a file</span>
+          }
+        </div>
+
+        <div class="editor-surface">
+          @if (activeTab; as tab) {
+            <app-monaco-editor
+              class="monaco-wrap"
+              [path]="tab.path"
+              [value]="tab.content"
+              (valueChange)="onEditorValueChange($event)"
+              (saveRequest)="saveActiveFile()"
+              (cursorChange)="onEditorCursor($event)"
+              (selectionChange)="onEditorSelection($event)"
+            ></app-monaco-editor>
+          } @else {
+            <div class="editor-empty">
+              <h2>PASS AI</h2>
+              <p>Import a real folder from your OS file explorer, or create a new file on the Java backend.</p>
+              <div class="empty-actions">
+                <button type="button" (click)="createNewFile()">New File</button>
+                <button type="button" (click)="triggerImportFolder()">Import Folder</button>
+              </div>
+            </div>
+          }
+        </div>
+      </div>
+
+      @if (showBottomPanel) {
+        <div
+          class="bottom-panel"
+          [class.maximized]="bottomMaximized"
+          [class.resizing]="activeResize === 'bottom'"
+          [style.height.px]="bottomPanelHeight"
+        >
+          <div
+            class="panel-sash panel-sash-n"
+            title="Drag to resize"
+            (mousedown)="startPanelResize('bottom', $event)"
+            (dblclick)="resetBottomPanelHeight()"
+          ></div>
+          <div class="bottom-tabs">
+            <div class="bottom-tabs-left">
+              <button type="button" [class.active]="bottomTab === 'problems'" (click)="bottomTab = 'problems'; refreshProblems()">PROBLEMS</button>
+              <button type="button" [class.active]="bottomTab === 'output'" (click)="bottomTab = 'output'">OUTPUT</button>
+              <button type="button" [class.active]="bottomTab === 'terminal'" (click)="bottomTab = 'terminal'; ideTerminal?.focus()">TERMINAL</button>
+              <button type="button" [class.active]="bottomTab === 'debug'" (click)="bottomTab = 'debug'">DEBUG CONSOLE</button>
+            </div>
+            <div class="bottom-tabs-right">
+              @if (bottomTab === 'terminal') {
+                <div class="term-toolbar">
+                  <span class="term-shell-icon" title="Shell">⌘</span>
+                  <select
+                    class="shell-select"
+                    [ngModel]="terminalShell"
+                    (ngModelChange)="switchTerminalShell($event)"
+                    title="Shell"
+                  >
+                    <option value="powershell">powershell</option>
+                    <option value="cmd">cmd</option>
+                  </select>
+                  <button type="button" class="term-tool" title="New Terminal" (click)="reconnectTerminal()">+</button>
+                  <button type="button" class="term-tool" title="Kill Terminal" (click)="killTerminal()">🗑</button>
+                  <button type="button" class="term-tool" title="Clear" (click)="clearTerminal()">⌫</button>
+                </div>
+              }
+              <button type="button" class="mini-btn" title="Maximize" (click)="toggleBottomMaximize()">⤢</button>
+              <button type="button" class="mini-btn" title="Hide panel" (click)="showBottomPanel = false">×</button>
+            </div>
+          </div>
+
+          <div class="bottom-content">
+            <div class="vscode-terminal" [class.hidden-pane]="bottomTab !== 'terminal'">
+              <app-ide-terminal
+                [shell]="terminalShell"
+                (statusChange)="onTerminalStatus($event)"
+              ></app-ide-terminal>
+            </div>
+            @if (bottomTab === 'problems') {
+              <div class="problems-list">
+                @for (p of problems; track p.file + p.line + p.message) {
+                  <button type="button" class="problem" [attr.data-sev]="p.severity" (click)="openRemoteFile(p.file)">
+                    <span class="sev">{{ p.severity }}</span>
+                    <span>{{ p.message }}</span>
+                    <span class="loc">{{ p.file }}:{{ p.line }}</span>
+                  </button>
+                }
+              </div>
+            }
+            @if (bottomTab === 'output') {
+              <div class="terminal">
+                @for (line of outputLines; track $index) {
+                  <div class="term-line">{{ line }}</div>
+                }
+              </div>
+            }
+            @if (bottomTab === 'debug') {
+              <div class="terminal">
+                <div class="term-input-row" style="margin-bottom: 8px">
+                  <span>&gt;</span>
+                  <input [(ngModel)]="debugCommand" (keydown.enter)="runDebug()" placeholder="Debug command (runs in workspace via Java)" />
+                  <button type="button" class="ghost-btn" style="padding:4px 8px" (click)="runDebug()">Run</button>
+                </div>
+                @for (line of debugOutput; track $index) {
+                  <div class="term-line">{{ line }}</div>
+                }
+              </div>
+            }
+          </div>
+        </div>
+      } @else {
+        <button class="show-bottom" type="button" (click)="showBottomPanel = true">Show Terminal</button>
+      }
+    </section>
+
+    @if (showAiPanel) {
+      <aside
+        class="ai-panel"
+        [class.resizing]="activeResize === 'ai'"
+        [style.width.px]="aiPanelWidth"
+      >
+        <div
+          class="panel-sash panel-sash-w"
+          title="Drag to resize"
+          (mousedown)="startPanelResize('ai', $event)"
+          (dblclick)="resetAiPanelWidth()"
+        ></div>
+        <div class="ai-header">
+          <span class="ai-title">PASS AI ASSISTANT</span>
+          <div class="ai-header-actions">
+            <div class="rag-mode" title="Semantic search (RAG)">
+              <button type="button" [class.active]="ragMode === 'auto'" (click)="setRagMode('auto')">Auto</button>
+              <button type="button" [class.active]="ragMode === 'on'" (click)="setRagMode('on')">On</button>
+              <button type="button" [class.active]="ragMode === 'off'" (click)="setRagMode('off')">Off</button>
+            </div>
+            <button
+              type="button"
+              class="icon-btn sm"
+              title="Index workspace now (manual)"
+              [disabled]="indexing"
+              (click)="indexWorkspaceForRag()"
+            >{{ indexing ? '…' : '◎' }}</button>
+            <button type="button" class="icon-btn sm" title="Check Ollama" (click)="refreshAiHealth()">♥</button>
+            <button type="button" class="icon-btn sm" title="New conversation" (click)="newConversation()">＋</button>
+            <button type="button" class="icon-btn sm" title="Clear current chat" (click)="resetChat()">↻</button>
+            <button type="button" class="icon-btn sm" title="Close" (click)="showAiPanel = false">×</button>
+          </div>
+        </div>
+
+        <div class="ai-tabs">
+          <button type="button" [class.active]="aiTab === 'chat'" (click)="aiTab = 'chat'">CHAT</button>
+          <button type="button" [class.active]="aiTab === 'history'" (click)="openHistoryTab()">HISTORY</button>
+        </div>
+
+        <div class="ai-body">
+          <div class="ai-main">
+          @if (aiTab === 'history') {
+            <aside class="conv-history conv-history-panel">
+              <div class="conv-history-head">
+                <span>Chats — {{ activeProject?.name || 'this project' }}</span>
+                <button type="button" class="ghost-btn" title="New" (click)="newConversation()">New</button>
+              </div>
+              <div class="conv-list">
+                @if (conversations.length === 0) {
+                  <p class="muted conv-empty">No saved chats yet. Send a message in Chat to create one.</p>
+                }
+                @for (c of conversations; track c.id) {
+                  <button
+                    type="button"
+                    class="conv-item"
+                    [class.active]="c.id === activeConversationId"
+                    (click)="openConversation(c.id)"
+                    [title]="c.title"
+                  >
+                    <span class="conv-title">{{ c.title }}</span>
+                    <span class="conv-meta">{{ c.mode }} · {{ c.messageCount }} msg</span>
+                    <span class="conv-del" title="Delete" (click)="deleteConversation(c.id, $event)">×</span>
+                  </button>
+                }
+              </div>
+            </aside>
+          }
+
+          @if (aiTab === 'chat') {
+            <div class="agent-pane" [class.has-proposals]="pendingProposals.length > 0">
+            <div class="chat-scroll" [class.welcome-mode]="messages.length === 0 && !activeConversationId">
+              @if (messages.length === 0 && activeConversationId) {
+                <div class="chat-welcome chat-resume-empty">
+                  <h2 class="welcome-title">{{ activeConversationTitle || 'Conversation' }}</h2>
+                  <p class="welcome-subtitle">
+                    No messages were saved in this chat yet. Send a message below to continue — it will be stored in History.
+                  </p>
+                </div>
+              } @else if (messages.length === 0) {
+                <div class="chat-welcome">
+                  <h2 class="welcome-title">
+                    <span class="welcome-wave">👋</span>
+                    Welcome to <span class="welcome-brand">PASS AI!</span>
+                  </h2>
+                  <p class="welcome-subtitle">How can I help you build something amazing today?</p>
+
+                  <div class="quick-list">
+                    @for (action of quickActions; track action.title) {
+                      <button type="button" class="quick-card" [attr.data-tone]="action.tone" (click)="useQuickAction(action.prompt)">
+                        <span class="quick-icon" aria-hidden="true">
+                          @switch (action.icon) {
+                            @case ('explain') {
+                              <svg viewBox="0 0 24 24" fill="none">
+                                <path d="M7 3.5h7.2L19 8.3V20a1.5 1.5 0 0 1-1.5 1.5H7A1.5 1.5 0 0 1 5.5 20V5A1.5 1.5 0 0 1 7 3.5Z" stroke="url(#pass-grad-blue)" stroke-width="1.6"/>
+                                <path d="M14.2 3.6V8H19" stroke="url(#pass-grad-blue)" stroke-width="1.6" stroke-linejoin="round"/>
+                                <path d="M8.5 12.5h7M8.5 16h5" stroke="url(#pass-grad-blue)" stroke-width="1.6" stroke-linecap="round"/>
+                                <defs>
+                                  <linearGradient id="pass-grad-blue" x1="5" y1="3" x2="19" y2="21">
+                                    <stop stop-color="#4DA3FF"/>
+                                    <stop offset="1" stop-color="#A855F7"/>
+                                  </linearGradient>
+                                </defs>
+                              </svg>
+                            }
+                            @case ('generate') {
+                              <svg viewBox="0 0 24 24" fill="none">
+                                <rect x="4.5" y="4.5" width="15" height="15" rx="2.5" stroke="url(#pass-grad-violet)" stroke-width="1.6"/>
+                                <path d="M9.5 4.5v15M4.5 10h5" stroke="url(#pass-grad-violet)" stroke-width="1.6"/>
+                                <defs>
+                                  <linearGradient id="pass-grad-violet" x1="4" y1="4" x2="20" y2="20">
+                                    <stop stop-color="#60A5FA"/>
+                                    <stop offset="1" stop-color="#C084FC"/>
+                                  </linearGradient>
+                                </defs>
+                              </svg>
+                            }
+                            @case ('refactor') {
+                              <svg viewBox="0 0 24 24" fill="none">
+                                <path d="M8 8H5.5A1.5 1.5 0 0 0 4 9.5v5A1.5 1.5 0 0 0 5.5 16H8" stroke="url(#pass-grad-teal)" stroke-width="1.6" stroke-linecap="round"/>
+                                <path d="M16 8h2.5A1.5 1.5 0 0 1 20 9.5v5a1.5 1.5 0 0 1-1.5 1.5H16" stroke="url(#pass-grad-teal)" stroke-width="1.6" stroke-linecap="round"/>
+                                <path d="M9 12h6M11 9.5 8.5 12 11 14.5M13 9.5 15.5 12 13 14.5" stroke="url(#pass-grad-teal)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                                <defs>
+                                  <linearGradient id="pass-grad-teal" x1="4" y1="8" x2="20" y2="16">
+                                    <stop stop-color="#2DD4BF"/>
+                                    <stop offset="1" stop-color="#60A5FA"/>
+                                  </linearGradient>
+                                </defs>
+                              </svg>
+                            }
+                            @case ('bugs') {
+                              <svg viewBox="0 0 24 24" fill="none">
+                                <circle cx="12" cy="12" r="4.2" stroke="url(#pass-grad-rose)" stroke-width="1.6"/>
+                                <path d="M12 4.5v2.2M12 17.3v2.2M4.5 12h2.2M17.3 12h2.2M6.4 6.4l1.6 1.6M16 16l1.6 1.6M17.6 6.4 16 8M8 16l-1.6 1.6" stroke="url(#pass-grad-rose)" stroke-width="1.6" stroke-linecap="round"/>
+                                <defs>
+                                  <linearGradient id="pass-grad-rose" x1="4" y1="4" x2="20" y2="20">
+                                    <stop stop-color="#FB7185"/>
+                                    <stop offset="1" stop-color="#E879F9"/>
+                                  </linearGradient>
+                                </defs>
+                              </svg>
+                            }
+                          }
+                        </span>
+                        <span class="quick-copy">
+                          <strong>{{ action.title }}</strong>
+                          <span>{{ action.desc }}</span>
+                        </span>
+                      </button>
+                    }
+                  </div>
+                </div>
+              } @else {
+                @for (msg of messages; track msg.id) {
+                  @if (msg.editing) {
+                    <div class="bubble user editing">
+                      <textarea
+                        class="edit-area"
+                        [(ngModel)]="msg.editText"
+                        (keydown.enter)="onEditEnter($event, msg)"
+                        rows="2"
+                      ></textarea>
+                      <div class="edit-actions">
+                        <button type="button" class="ghost-btn" (click)="cancelEditMessage(msg)">Cancel</button>
+                        <button type="button" class="mini-primary" (click)="submitEditMessage(msg)">Send</button>
+                      </div>
+                    </div>
+                  } @else {
+                    <div
+                      class="bubble"
+                      [class.user]="msg.role === 'user'"
+                      [class.assistant]="msg.role === 'assistant'"
+                      [class.pending]="msg.pending"
+                      [class.error]="msg.error"
+                      [class.editable]="msg.role === 'user' && !chatSending"
+                      (dblclick)="msg.role === 'user' && startEditMessage(msg)"
+                    >
+                      {{ msg.text || (msg.pending ? 'Thinking…' : '') }}
+                      @if (msg.role === 'user' && !chatSending) {
+                        <button
+                          type="button"
+                          class="bubble-edit-btn"
+                          title="Edit and resend"
+                          (click)="startEditMessage(msg)"
+                        >
+                          <svg viewBox="0 0 24 24" width="13" height="13" fill="none">
+                            <path d="M4 20h4l10-10-4-4L4 16v4Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                            <path d="M13.5 6.5l4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                          </svg>
+                        </button>
+                      }
+                    </div>
+                  }
+                }
+              }
+              @if (artifactsVisible && (projectPlan?.files?.length || projectPlan?.phases?.length)) {
+                <div class="project-plan-panel">
+                  <div class="proposal-header">
+                    <span>Plan: {{ projectPlan?.title || 'Project' }}{{ projectPlan?.stack ? ' · ' + projectPlan?.stack : '' }}</span>
+                    <div class="proposal-actions">
+                      @if (specializedAgentMode === 'scaffold' && hasScaffoldMissing) {
+                        <button type="button" class="ghost-btn" [disabled]="chatSending" (click)="continueScaffold()" title="Manual retry if auto-continue stalls">Continue missing</button>
+                      }
+                      @if (specializedAgentMode === 'scaffold' && canContinueNextPhase) {
+                        <button type="button" class="ghost-btn" [disabled]="chatSending" (click)="continueNextPhase()">Next phase</button>
+                      }
+                      <button type="button" class="ghost-btn" (click)="artifactsVisible = false" title="Hide the plan">×</button>
+                    </div>
+                  </div>
+                  @if (projectPlan?.summary) {
+                    <p class="plan-summary">{{ projectPlan?.summary }}</p>
+                  }
+                  @if (projectPlan?.phases?.length) {
+                    <div class="phase-strip">
+                      @for (ph of projectPlan!.phases!; track $index) {
+                        <div
+                          class="phase-chip"
+                          [attr.data-status]="ph.status || ($index === (projectPlan?.currentPhase || 0) ? 'active' : 'pending')"
+                          [class.current]="$index === (projectPlan?.currentPhase || 0)"
+                        >
+                          <span class="phase-idx">{{ $index + 1 }}</span>
+                          <span class="phase-name">{{ ph.name || ('Phase ' + ($index + 1)) }}</span>
+                        </div>
+                      }
+                    </div>
+                  }
+                  @for (f of projectPlan?.files; track f.path) {
+                    <div class="plan-file" [attr.data-status]="f.status || 'pending'">
+                      <span class="plan-status">{{ f.status || 'pending' }}</span>
+                      <span class="plan-path">{{ f.path }}</span>
+                      <span class="plan-purpose">{{ f.purpose }}</span>
+                    </div>
+                  }
+                </div>
+              }
+              @if (artifactsVisible && agentToolSteps.length) {
+                <div class="tool-steps">
+                  <div class="tool-steps-title">Tool steps</div>
+                  @for (step of agentToolSteps; track $index) {
+                    <div class="tool-step" [attr.data-status]="step.status">
+                      <span class="tool-name">{{ step.name }}</span>
+                      <span class="tool-args">{{ step.argsSummary }}</span>
+                      <span class="tool-status">{{ step.status }}</span>
+                    </div>
+                  }
+                </div>
+              }
+              @if (artifactsVisible && reviewFindings.length) {
+                <div class="findings-panel">
+                  <div class="tool-steps-title">Review findings</div>
+                  @for (f of reviewFindings; track $index) {
+                    <div class="finding-row" [attr.data-severity]="f.severity || 'info'">
+                      <span class="finding-sev">{{ f.severity || 'info' }}</span>
+                      <span class="finding-loc">{{ f.path }}{{ f.line != null ? ':' + f.line : '' }}</span>
+                      <span class="finding-msg">{{ f.message }}</span>
+                    </div>
+                  }
+                </div>
+              }
+              @if (artifactsVisible && testRunSummary) {
+                <div class="test-run-panel">
+                  <div class="tool-steps-title">Test run</div>
+                  <pre class="test-run-pre">{{ testRunSummary }}</pre>
+                </div>
+              }
+              @if (artifactsVisible && scaffoldPreview?.warnings?.length) {
+                <div class="findings-panel">
+                  <div class="tool-steps-title">Layout check</div>
+                  @for (w of scaffoldPreview!.warnings!; track $index) {
+                    <div class="finding-row" data-severity="warn">
+                      <span class="finding-msg">{{ w }}</span>
+                    </div>
+                  }
+                </div>
+              }
+              @if (artifactsVisible && scaffoldPreview?.screenshotAvailable && scaffoldPreview?.screenshotBase64) {
+                <div class="preview-panel">
+                  <div class="tool-steps-title">Rendered preview</div>
+                  <img class="scaffold-preview-img" [src]="'data:image/png;base64,' + scaffoldPreview!.screenshotBase64" alt="Scaffold preview" />
+                </div>
+              }
+              @if (artifactsVisible && pendingInstalls.length) {
+                <div class="install-panel">
+                  <div class="tool-steps-title">{{ pendingInstalls.length }} install command(s) — review &amp; Install</div>
+                  @for (cmd of pendingInstalls; track $index) {
+                    <div class="install-row">
+                      <code>{{ cmd.command }}</code>
+                      @if (cmd.reason) {
+                        <span class="install-reason">{{ cmd.reason }}</span>
+                      }
+                    </div>
+                  }
+                  <button type="button" class="ghost-btn" [disabled]="installApplying" (click)="installAllProposals()">Install</button>
+                </div>
+              }
+            </div>
+
+            @if (pendingProposals.length) {
+              <div
+                class="proposal-resizer"
+                role="separator"
+                aria-orientation="horizontal"
+                title="Drag to resize · double-click to reset"
+                (mousedown)="startProposalResize($event)"
+                (dblclick)="resetProposalHeight()"
+              ></div>
+              <div
+                class="proposal-panel"
+                #proposalPanelEl
+                [class.resized]="proposalPanelHeight !== null"
+                [style.height.px]="proposalPanelHeight"
+              >
+                <div class="proposal-header">
+                  <span>{{ pendingProposals.length }} proposed file(s) — review diffs</span>
+                  <div class="proposal-actions">
+                    <button type="button" class="ghost-btn" [disabled]="agentApplying" (click)="applyAllProposals()">Apply all</button>
+                    <button type="button" class="ghost-btn" [disabled]="agentApplying" (click)="discardProposals()">Discard</button>
+                  </div>
+                </div>
+                @for (file of pendingProposals; track file.path) {
+                  <div class="proposal-card" [class.expanded]="expandedDiffPath === file.path">
+                    <div class="proposal-meta">
+                      <span class="proposal-action" [attr.data-action]="file.action">{{ file.action }}</span>
+                      <button type="button" class="proposal-path-btn" [title]="file.path" (click)="toggleDiff(file.path)">
+                        {{ file.path }}
+                        <span class="diff-toggle">{{ expandedDiffPath === file.path ? '▾' : '▸' }}</span>
+                      </button>
+                      <button type="button" class="ghost-btn" [disabled]="agentApplying" (click)="applyOneProposal(file)">Apply</button>
+                    </div>
+                    @if (expandedDiffPath === file.path) {
+                      <div class="proposal-diff-wrap" role="region" [attr.aria-label]="'Diff ' + file.path">
+                        @for (line of proposalDiffLines(file); track $index) {
+                          <div class="diff-line" [attr.data-kind]="line.kind">{{ line.text }}</div>
+                        }
+                      </div>
+                    }
+                  </div>
+                }
+              </div>
+            }
+
+            <div class="chat-composer">
+              <div class="composer-toolbar">
+                <div class="assistant-mode-bar" role="group" aria-label="Assistant mode">
+                  <button
+                    type="button"
+                    class="assistant-mode-btn"
+                    [class.active]="assistantMode === 'ask'"
+                    [disabled]="chatSending"
+                    (click)="setAssistantMode('ask')"
+                    title="Answer questions about the code — never changes files"
+                  >Ask</button>
+                  <button
+                    type="button"
+                    class="assistant-mode-btn"
+                    [class.active]="assistantMode === 'build'"
+                    [disabled]="chatSending"
+                    (click)="setAssistantMode('build')"
+                    title="Let the agent use tools and propose file changes"
+                  >Build</button>
+                </div>
+
+                <div class="composer-actions">
+                  @if (!artifactsVisible && (projectPlan?.files?.length || projectPlan?.phases?.length)) {
+                    <button
+                      type="button"
+                      class="composer-action-btn"
+                      (click)="artifactsVisible = true"
+                      title="Show plan — the build plan and its phase progress"
+                      aria-label="Show plan"
+                    >
+                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none">
+                        <path d="M5 7h10M5 12h10M5 17h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+                        <path d="M18 7.5l1.4 1.4L22 6.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    </button>
+                  }
+                  <button
+                    type="button"
+                    class="composer-action-btn"
+                    [disabled]="chatSending || verifyRunning"
+                    (click)="handleRunProject('run')"
+                    title="Run — start the project in the terminal"
+                    aria-label="Run project"
+                  >
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none">
+                      <path d="M7 5.5l11 6.5-11 6.5V5.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="composer-action-btn"
+                    [disabled]="chatSending"
+                    (click)="handleProjectStatus('what happened?')"
+                    title="What happened? — read the terminal output and explain the result"
+                    aria-label="What happened"
+                  >
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none">
+                      <circle cx="12" cy="12" r="8.2" stroke="currentColor" stroke-width="1.7"/>
+                      <path d="M9.8 9.4a2.3 2.3 0 1 1 3.2 2.1c-.7.3-1 .8-1 1.5v.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+                      <circle cx="12" cy="16.4" r="0.9" fill="currentColor"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="composer-action-btn"
+                    [class.busy]="verifyRunning"
+                    [disabled]="verifyRunning || chatSending"
+                    (click)="runVerifyLoop('auto-fix and verify')"
+                    title="Auto-fix &amp; verify — build, read errors, fix, rebuild (up to 3 tries)"
+                    aria-label="Auto-fix and verify"
+                  >
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none">
+                      <path d="M13 3l-2 7h5l-3 11 1.5-8H9.5L13 3Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                  @if (canRevertAutoFix) {
+                    <button
+                      type="button"
+                      class="composer-action-btn"
+                      (click)="revertAutoFix()"
+                      title="Undo auto-fix — revert every edit the loop made"
+                      aria-label="Undo auto-fix"
+                    >
+                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none">
+                        <path d="M4 9h9.5a4.5 4.5 0 1 1 0 9H8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+                        <path d="M7 5.5L3.5 9 7 12.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    </button>
+                  }
+                </div>
+              </div>
+
+              @if (assistantMode === 'build') {
+                <div class="agent-mode-bar">
+                  @for (a of specializedAgents; track a.id) {
+                    <button
+                      type="button"
+                      class="agent-mode-btn"
+                      [class.active]="specializedAgentMode === a.id"
+                      [title]="a.hint"
+                      (click)="setSpecializedAgentMode(a.id)"
+                    >{{ a.label }}</button>
+                  }
+                </div>
+                <div class="agent-hint">
+                  @switch (specializedAgentMode) {
+                    @case ('scaffold') {
+                      Full-stack in <strong>phases</strong>: Apply phase 1, then <strong>Next phase</strong>.
+                    }
+                    @case ('review') {
+                      Read-only review — findings only, no file writes.
+                    }
+                    @case ('test') {
+                      Writes test files (Apply) and runs them in the sandbox.
+                    }
+                    @case ('docs') {
+                      Documentation proposals → Diff Apply.
+                    }
+                    @case ('research') {
+                      Explains the codebase via read/search tools (no writes).
+                    }
+                    @default {
+                      Edits files via Diff Apply. Paste a terminal error to fix it.
+                    }
+                  }
+                </div>
+              }
+
+              <div class="composer-box">
+                <span class="at-chip">{{ assistantMode === 'build' ? '@ build' : '@ ask' }}</span>
+                <textarea
+                  [(ngModel)]="chatInput"
+                  (keydown.enter)="onChatEnter($event)"
+                  [placeholder]="assistantMode === 'build' ? 'Describe what to build or change…' : 'Ask about your code…'"
+                  rows="2"
+                  [disabled]="chatSending"
+                ></textarea>
+                @if (chatSending) {
+                  <button class="send-btn stop-btn" type="button" (click)="stopAssistant()" title="Stop">
+                    <svg viewBox="0 0 24 24" width="16" height="16">
+                      <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/>
+                    </svg>
+                  </button>
+                } @else {
+                  <button class="send-btn" type="button" (click)="send()" title="Send">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+                      <path d="M5 12h12M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                }
+              </div>
+            </div>
+            </div>
+          }
+          </div>
+        </div>
+      </aside>
+    }
+  </div>
+
+  <footer class="statusbar">
+    <div class="status-left">
+      <span class="branch">⎇ workspace</span>
+      <span class="sync" title="Sync">{{ importing ? importProgress : (statusMessage || 'ready') }}</span>
+      <span class="diag">✕ {{ errorCount }}</span>
+      <span class="diag">⚠ {{ warningCount }}</span>
+      <span class="diag">ℹ {{ infoCount }}</span>
+    </div>
+    <div class="status-right">
+      <span>Ln {{ cursorLine }}, Col {{ cursorCol }}</span>
+      <span>{{ activeTab ? fileIcon(activeTab.title, 'file').kind.toUpperCase() : 'PLAINTEXT' }}</span>
+      <span>Spaces: 2</span>
+      <span>UTF-8</span>
+      <span>LF</span>
+      <button type="button" class="status-icon" title="Save (Ctrl+S)" (click)="saveActiveFile()">SAVE</button>
+      <button type="button" class="status-icon" title="Delete file" (click)="deleteActivePath()">DEL</button>
+    </div>
+  </footer>
+  </div>
+
+  @if (editSubmitDialog) {
+    <div class="modal-backdrop" (click)="cancelEditDialog()">
+      <div class="modal-card edit-revert-card" (click)="$event.stopPropagation()">
+        <button type="button" class="modal-close" title="Close" (click)="cancelEditDialog()">×</button>
+        <h3>Submit from a previous message?</h3>
+        <p>
+          Submitting from a previous message will revert file changes to before this message and clear
+          the messages after this one.
+        </p>
+        <div class="edit-revert-footer">
+          <label class="dont-ask">
+            <input type="checkbox" [(ngModel)]="dontAskEditRevert" />
+            <span>Don't Ask Again</span>
+          </label>
+          <div class="modal-actions edit-revert-actions">
+            <button type="button" class="modal-ghost" (click)="cancelEditDialog()">Cancel</button>
+            <button type="button" class="modal-secondary" (click)="confirmEditDialog(false)">Don't revert</button>
+            <button type="button" class="modal-primary" (click)="confirmEditDialog(true)" [disabled]="!editSubmitDialog?.canRevert">Revert</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  }
+
+  @if (showCreateSkeletonModal) {
+    <div class="modal-backdrop" (click)="cancelCreateSkeletonModal()">
+      <div class="modal-card skeleton-modal" (click)="$event.stopPropagation()">
+        <button type="button" class="modal-close" title="Close" (click)="cancelCreateSkeletonModal()" [disabled]="skeletonSubmitting">×</button>
+        <h3>Create Project</h3>
+        <p class="skeleton-lead">Instant template-based skeleton — no AI. Pick your stack, metadata, and dependencies.</p>
+
+        @if (skeletonError) {
+          <div class="skeleton-error">{{ skeletonError }}</div>
+        }
+
+        <div class="skeleton-body">
+          <div class="skeleton-form">
+            <label class="skeleton-field">
+              <span>Stack</span>
+              <select [(ngModel)]="skeletonForm.stack" (ngModelChange)="onSkeletonStackChange()" [disabled]="skeletonSubmitting">
+                <option value="spring-boot">Spring Boot</option>
+                <option value="angular">Angular</option>
+              </select>
+            </label>
+
+            <label class="skeleton-field">
+              <span>Project name</span>
+              <input
+                type="text"
+                [(ngModel)]="skeletonForm.projectName"
+                (ngModelChange)="onSkeletonProjectNameChange()"
+                [disabled]="skeletonSubmitting"
+                placeholder="demo"
+              />
+            </label>
+
+            @if (skeletonForm.stack === 'spring-boot') {
+              <div class="skeleton-grid">
+                <label class="skeleton-field">
+                  <span>Group ID</span>
+                  <input type="text" [(ngModel)]="skeletonForm.groupId" [disabled]="skeletonSubmitting" placeholder="com.pass" />
+                </label>
+                <label class="skeleton-field">
+                  <span>Artifact ID</span>
+                  <input type="text" [(ngModel)]="skeletonForm.artifactId" [disabled]="skeletonSubmitting" placeholder="demo" />
+                </label>
+              </div>
+
+              <label class="skeleton-field">
+                <span>Package name</span>
+                <input type="text" [value]="skeletonPackageName" readonly tabindex="-1" />
+              </label>
+
+              <div class="skeleton-grid">
+                <label class="skeleton-field">
+                  <span>Java version</span>
+                  <select [(ngModel)]="skeletonForm.javaVersion" [disabled]="skeletonSubmitting">
+                    <option value="17">17</option>
+                    <option value="21">21</option>
+                  </select>
+                </label>
+                <label class="skeleton-field">
+                  <span>Packaging</span>
+                  <select [(ngModel)]="skeletonForm.packaging" [disabled]="skeletonSubmitting">
+                    <option value="jar">JAR</option>
+                    <option value="war">WAR</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="skeleton-meta-note">
+                Spring Boot <strong>4.1.0</strong> · Maven · Java
+              </div>
+            } @else {
+              <div class="skeleton-checks">
+                <label class="skeleton-check">
+                  <input type="checkbox" [(ngModel)]="skeletonForm.routing" [disabled]="skeletonSubmitting" />
+                  <span>Include routing</span>
+                </label>
+                <label class="skeleton-check">
+                  <input type="checkbox" [(ngModel)]="skeletonForm.material" [disabled]="skeletonSubmitting" />
+                  <span>Include Angular Material</span>
+                </label>
+              </div>
+              <div class="skeleton-meta-note">
+                Angular <strong>22</strong> · standalone · TypeScript
+              </div>
+            }
+          </div>
+
+          <aside class="skeleton-deps-panel">
+            <div class="skeleton-deps-head">
+              <h4>Dependencies</h4>
+              @if (skeletonForm.stack === 'spring-boot') {
+                <button type="button" class="skeleton-add-deps" (click)="openSkeletonDepPicker()" [disabled]="skeletonSubmitting">
+                  Add… <span class="skeleton-kbd">Ctrl+B</span>
+                </button>
+              }
+            </div>
+
+            @if (skeletonForm.stack === 'spring-boot') {
+              @if (!selectedSkeletonDeps.length) {
+                <p class="skeleton-empty">No dependency selected</p>
+              } @else {
+                <ul class="skeleton-dep-list">
+                  @for (dep of selectedSkeletonDeps; track dep.id) {
+                    <li class="skeleton-dep-item">
+                      <div>
+                        <strong>{{ dep.name }}</strong>
+                        <span>{{ dep.description }}</span>
+                      </div>
+                      <button type="button" class="skeleton-dep-remove" (click)="removeSkeletonDependency(dep.id)" [disabled]="skeletonSubmitting" title="Remove">×</button>
+                    </li>
+                  }
+                </ul>
+              }
+            } @else {
+              <ul class="skeleton-dep-list">
+                @if (skeletonForm.routing) {
+                  <li class="skeleton-dep-item static">
+                    <div>
+                      <strong>Angular Router</strong>
+                      <span>Client-side navigation and route configuration.</span>
+                    </div>
+                  </li>
+                }
+                @if (skeletonForm.material) {
+                  <li class="skeleton-dep-item static">
+                    <div>
+                      <strong>Angular Material</strong>
+                      <span>Material Design components for Angular.</span>
+                    </div>
+                  </li>
+                }
+                @if (!skeletonForm.routing && !skeletonForm.material) {
+                  <p class="skeleton-empty">No dependency selected</p>
+                }
+              </ul>
+            }
+          </aside>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="modal-ghost" (click)="cancelCreateSkeletonModal()" [disabled]="skeletonSubmitting">Cancel</button>
+          <button type="button" class="modal-primary" (click)="submitCreateSkeleton()" [disabled]="skeletonSubmitting">
+            {{ skeletonSubmitting ? 'Creating…' : 'Create Project' }}
+          </button>
+        </div>
+
+        @if (showSkeletonDepPicker) {
+          <div class="skeleton-picker-backdrop" (click)="closeSkeletonDepPicker()">
+            <div class="skeleton-picker" (click)="$event.stopPropagation()">
+              <header class="skeleton-picker-head">
+                <h4>Add Dependencies</h4>
+                <button type="button" class="skeleton-picker-close" (click)="closeSkeletonDepPicker()">×</button>
+              </header>
+              <input
+                class="skeleton-picker-search"
+                type="search"
+                placeholder="Search dependencies…"
+                [(ngModel)]="skeletonDepSearch"
+              />
+              <ul class="skeleton-picker-list">
+                @for (dep of filteredSkeletonDeps; track dep.id) {
+                  <li>
+                    <button
+                      type="button"
+                      class="skeleton-picker-item"
+                      [class.selected]="skeletonForm.dependencies[dep.id]"
+                      (click)="toggleSkeletonDependency(dep.id)"
+                    >
+                      <span class="skeleton-picker-check">{{ skeletonForm.dependencies[dep.id] ? '✓' : '' }}</span>
+                      <span class="skeleton-picker-text">
+                        <strong>{{ dep.name }}</strong>
+                        <span>{{ dep.description }}</span>
+                      </span>
+                    </button>
+                  </li>
+                }
+              </ul>
+            </div>
+          </div>
+        }
+      </div>
+    </div>
+  }
+
+  @if (showOpenTargetDialog) {
+    <div class="modal-backdrop" (click)="cancelOpenTarget()">
+      <div class="modal-card" (click)="$event.stopPropagation()">
+        <h3>Open Folder</h3>
+        <p>Open a <strong>real local folder</strong>. Edits, deletes and renames will change files on your disk.</p>
+        <div class="modal-actions">
+          <button type="button" class="modal-primary" (click)="chooseOpenTarget('this')">This window</button>
+          <button type="button" class="modal-secondary" (click)="chooseOpenTarget('new')">New window</button>
+          <button type="button" class="modal-ghost" (click)="cancelOpenTarget()">Cancel</button>
+        </div>
+      </div>
+    </div>
+  }
+
+  @if (importing) {
+    <div class="import-banner">{{ importProgress || 'Importing…' }}</div>
+  }
+
+  @if (contextMenu) {
+    <div
+      class="ctx-menu"
+      [style.left.px]="contextMenu.x"
+      [style.top.px]="contextMenu.y"
+      (click)="$event.stopPropagation()"
+      (contextmenu)="$event.preventDefault()"
+    >
+      <button type="button" (click)="ctxAddToChat()">Add to Chat</button>
+      <button type="button" (click)="ctxRevealInExplorer()">Reveal in File Explorer</button>
+      <div class="ctx-sep"></div>
+      <button type="button" (click)="ctxNewFile()">New File</button>
+      <button type="button" (click)="ctxNewFolder()">New Folder</button>
+      <div class="ctx-sep"></div>
+      <button type="button" (click)="ctxCopyPath(false)">Copy Path</button>
+      <button type="button" (click)="ctxCopyPath(true)">Copy Relative Path</button>
+      <div class="ctx-sep"></div>
+      <button type="button" [disabled]="!contextMenu.node.path" (click)="ctxCut()">Cut</button>
+      <button type="button" [disabled]="!contextMenu.node.path" (click)="ctxCopy()">Copy</button>
+      @if (explorerClipboard) {
+        <button type="button" (click)="ctxPaste()">Paste</button>
+      }
+      <div class="ctx-sep"></div>
+      <button type="button" [disabled]="!contextMenu.node.path" (click)="ctxRename()">Rename</button>
+      <button type="button" class="danger" [disabled]="!contextMenu.node.path" (click)="ctxDelete()">Delete</button>
+    </div>
+  }
+</div>

@@ -1,0 +1,12 @@
+# After LoRA + GGUF conversion, point FROM at your GGUF-imported base or use:
+#   ollama create pass-ai-tuned -f Modelfile.pass-ai-tuned
+#
+# Replace the FROM line with your exported model name once ready.
+FROM qwen2.5-coder:7b
+
+PARAMETER temperature 0.2
+PARAMETER num_ctx 8192
+
+SYSTEM """
+You are PASS AI Agent (locally fine-tuned). Prefer pass-tool JSON blocks for read_file, search, write_file, run_terminal, and done.
+"""
